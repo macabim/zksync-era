@@ -386,6 +386,7 @@ impl StateKeeper {
         client: Box<DynClient<L2>>,
     ) -> anyhow::Result<()> {
         en::EN {
+            main_node_poll_interval: time::Duration::milliseconds(500),
             pool: self.pool,
             client,
             sync_state: self.sync_state.clone(),
@@ -402,6 +403,7 @@ impl StateKeeper {
         cfgs: ConfigSet,
     ) -> anyhow::Result<()> {
         en::EN {
+            main_node_poll_interval: time::Duration::milliseconds(500),
             pool: self.pool,
             client,
             sync_state: self.sync_state.clone(),

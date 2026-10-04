@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Context as _;
 use zksync_concurrency::{ctx, scope, sync};
 use zksync_config::configs::consensus::{ConsensusConfig, ConsensusSecrets};
@@ -18,6 +20,7 @@ use zksync_web3_decl::client::{DynClient, L2};
 /// Wiring layer for external node consensus component.
 #[derive(Debug)]
 pub struct ExternalNodeConsensusLayer {
+    pub main_node_poll_interval: Duration,
     pub build_version: semver::Version,
     pub config: Option<ConsensusConfig>,
     pub secrets: Option<ConsensusSecrets>,
@@ -72,6 +75,7 @@ impl WiringLayer for ExternalNodeConsensusLayer {
         };
 
         let consensus_task = ExternalNodeTask {
+            main_node_poll_interval: self.main_node_poll_interval,
             build_version: self.build_version,
             config,
             pool,
@@ -85,6 +89,7 @@ impl WiringLayer for ExternalNodeConsensusLayer {
 
 #[derive(Debug)]
 pub struct ExternalNodeTask {
+    main_node_poll_interval: Duration,
     build_version: semver::Version,
     config: Option<(ConsensusConfig, ConsensusSecrets)>,
     pool: ConnectionPool<Core>,
@@ -115,6 +120,7 @@ impl Task for ExternalNodeTask {
                 self.main_node_client,
                 self.action_queue_sender,
                 self.build_version,
+                self.main_node_poll_interval,
             ));
             // `run_external_node` might return an error or panic,
             // in which case we need to return immediately,

@@ -57,8 +57,17 @@ pub async fn run_external_node(
     main_node_client: Box<DynClient<L2>>,
     actions: ActionQueueSender,
     build_version: semver::Version,
+    main_node_poll_interval: std::time::Duration,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        (std::time::Duration::from_millis(1)..=std::time::Duration::from_secs(60))
+            .contains(&main_node_poll_interval),
+        "main node poll interval must be between 1ms and 60s"
+    );
     let en = en::EN {
+        main_node_poll_interval: zksync_concurrency::time::Duration::milliseconds(
+            main_node_poll_interval.as_millis().try_into()?,
+        ),
         pool: storage::ConnectionPool(pool),
         sync_state: sync_state.clone(),
         client: main_node_client.for_component("block_fetcher"),

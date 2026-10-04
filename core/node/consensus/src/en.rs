@@ -44,6 +44,7 @@ async fn wait_for_main_node_block(
 
 /// External node.
 pub(super) struct EN {
+    pub(super) main_node_poll_interval: time::Duration,
     pub(super) pool: ConnectionPool,
     pub(super) sync_state: SyncState,
     pub(super) client: Box<DynClient<L2>>,
@@ -206,14 +207,14 @@ impl EN {
     /// Periodically fetches the head of the main node
     /// and updates `SyncState` accordingly.
     async fn fetch_state_loop(&self, ctx: &ctx::Ctx) -> ctx::Result<()> {
-        const DELAY_INTERVAL: time::Duration = time::Duration::milliseconds(500);
         const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
+        tracing::info!(poll_interval = ?self.main_node_poll_interval, "polling main node heads");
         loop {
             match ctx.wait(self.client.get_block_number()).await? {
                 Ok(head) => {
                     let head = L2BlockNumber(head.try_into().ok().context("overflow")?);
                     self.sync_state.set_main_node_block(head);
-                    ctx.sleep(DELAY_INTERVAL).await?;
+                    ctx.sleep(self.main_node_poll_interval).await?;
                 }
                 Err(err) => {
                     tracing::warn!("get_block_number(): {err}");
