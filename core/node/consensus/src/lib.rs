@@ -71,9 +71,7 @@ pub async fn run_external_node(
         "main node poll interval must be between 1ms and 60s"
     );
     let en = en::EN {
-        main_node_poll_interval: zksync_concurrency::time::Duration::milliseconds(
-            params.main_node_poll_interval.as_millis().try_into()?,
-        ),
+        main_node_poll_interval: params.main_node_poll_interval.try_into()?,
         pool: storage::ConnectionPool(pool),
         sync_state: sync_state.clone(),
         client: main_node_client.for_component("block_fetcher"),
