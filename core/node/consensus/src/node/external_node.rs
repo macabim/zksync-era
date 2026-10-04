@@ -119,8 +119,10 @@ impl Task for ExternalNodeTask {
                 self.sync_state,
                 self.main_node_client,
                 self.action_queue_sender,
-                self.build_version,
-                self.main_node_poll_interval,
+                crate::ExternalNodeParams {
+                    build_version: self.build_version,
+                    main_node_poll_interval: self.main_node_poll_interval,
+                },
             ));
             // `run_external_node` might return an error or panic,
             // in which case we need to return immediately,

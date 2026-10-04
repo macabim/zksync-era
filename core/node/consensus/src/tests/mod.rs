@@ -846,9 +846,17 @@ async fn test_with_pruning(version: ProtocolVersionId) {
     .unwrap();
 }
 
-#[test_casing(4, Product((FROM_SNAPSHOT,VERSIONS)))]
+#[test_casing(12, Product((
+    FROM_SNAPSHOT,
+    [ProtocolVersionId::Version30, ProtocolVersionId::latest(), ProtocolVersionId::next()],
+    [time::Duration::milliseconds(50), time::Duration::milliseconds(500)]
+)))]
 #[tokio::test]
-async fn test_centralized_fetcher(from_snapshot: bool, version: ProtocolVersionId) {
+async fn test_centralized_fetcher(
+    from_snapshot: bool,
+    version: ProtocolVersionId,
+    main_node_poll_interval: time::Duration,
+) {
     zksync_concurrency::testonly::abort_on_panic();
     let ctx = &ctx::test_root(&ctx::RealClock);
     let rng = &mut ctx.rng();
@@ -869,7 +877,11 @@ async fn test_centralized_fetcher(from_snapshot: bool, version: ProtocolVersionI
         let node_pool = ConnectionPool::test(from_snapshot, version).await;
         let (node, runner) = testonly::StateKeeper::new(ctx, node_pool.clone()).await?;
         s.spawn_bg(runner.run(ctx).instrument(tracing::info_span!("fetcher")));
-        s.spawn_bg(node.run_fetcher(ctx, validator.connect(ctx).await?));
+        s.spawn_bg(node.run_fetcher_with_poll_interval(
+            ctx,
+            validator.connect(ctx).await?,
+            main_node_poll_interval,
+        ));
 
         tracing::info!("Produce some blocks and wait for node to fetch them");
         validator.push_random_blocks(rng, account, 10).await;
