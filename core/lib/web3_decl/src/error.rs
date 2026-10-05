@@ -86,6 +86,14 @@ pub fn is_retryable(err: &ClientError) -> bool {
     }
 }
 
+/// Whether a read failed with a transient HTTP gateway or service status.
+/// Rate-limit responses retain the caller's existing cooldown.
+pub fn is_transient_http_error(err: &ClientError) -> bool {
+    matches!(err, ClientError::Transport(err)
+        if matches!(err.downcast_ref::<jsonrpsee::http_client::transport::Error>(),
+            Some(jsonrpsee::http_client::transport::Error::Rejected { status_code: 502 | 503 | 504 })))
+}
+
 /// Alias for a result with enriched client RPC error.
 pub type EnrichedClientResult<T> = Result<T, EnrichedClientError>;
 
@@ -231,5 +239,25 @@ where
             method,
             args: HashMap::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod transient_http_tests {
+    use super::*;
+
+    #[test]
+    fn only_gateway_and_service_failures_use_fast_retry() {
+        for status_code in [400, 403, 429, 500, 502, 503, 504] {
+            let error = jsonrpsee::http_client::transport::Error::Rejected { status_code };
+            assert_eq!(
+                is_transient_http_error(&ClientError::Transport(error.into())),
+                matches!(status_code, 502 | 503 | 504)
+            );
+        }
+        assert!(!is_transient_http_error(&ClientError::RequestTimeout));
+        assert!(!is_transient_http_error(&ClientError::Call(
+            jsonrpsee::types::ErrorObjectOwned::owned(-32602, "invalid params", None::<()>)
+        )));
     }
 }

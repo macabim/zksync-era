@@ -11,7 +11,7 @@ use zksync_shared_resources::api::SyncState;
 use zksync_types::L2BlockNumber;
 use zksync_web3_decl::{
     client::{DynClient, L2},
-    error::is_retryable,
+    error::{is_retryable, is_transient_http_error},
     namespaces::{EnNamespaceClient as _, EthNamespaceClient as _},
 };
 
@@ -21,6 +21,30 @@ use crate::{
     registry::{Registry, RegistryAddress},
     storage::{self, ConnectionPool},
 };
+
+/// Backoff for transient HTTP failures. Other errors retain the five-second cooldown.
+struct HttpRetry(time::Duration);
+
+impl Default for HttpRetry {
+    fn default() -> Self {
+        Self(time::Duration::milliseconds(200))
+    }
+}
+
+impl HttpRetry {
+    fn after_error(
+        &mut self,
+        error: &zksync_web3_decl::jsonrpsee::core::ClientError,
+    ) -> time::Duration {
+        const MAX: time::Duration = time::Duration::seconds(5);
+        if !is_transient_http_error(error) {
+            return MAX;
+        }
+        let delay = self.0;
+        self.0 = (delay + delay).min(MAX);
+        delay
+    }
+}
 
 /// Whenever more than FALLBACK_FETCHER_THRESHOLD certificates are missing,
 /// the fallback fetcher is active.
@@ -44,6 +68,7 @@ async fn wait_for_main_node_block(
 
 /// External node.
 pub(super) struct EN {
+    pub(super) main_node_poll_interval: time::Duration,
     pub(super) pool: ConnectionPool,
     pub(super) sync_state: SyncState,
     pub(super) client: Box<DynClient<L2>>,
@@ -206,18 +231,20 @@ impl EN {
     /// Periodically fetches the head of the main node
     /// and updates `SyncState` accordingly.
     async fn fetch_state_loop(&self, ctx: &ctx::Ctx) -> ctx::Result<()> {
-        const DELAY_INTERVAL: time::Duration = time::Duration::milliseconds(500);
-        const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
+        let mut transient_retry = HttpRetry::default();
+        tracing::info!(poll_interval = ?self.main_node_poll_interval, "polling main node heads");
         loop {
             match ctx.wait(self.client.get_block_number()).await? {
                 Ok(head) => {
+                    transient_retry = HttpRetry::default();
                     let head = L2BlockNumber(head.try_into().ok().context("overflow")?);
                     self.sync_state.set_main_node_block(head);
-                    ctx.sleep(DELAY_INTERVAL).await?;
+                    ctx.sleep(self.main_node_poll_interval).await?;
                 }
                 Err(err) => {
-                    tracing::warn!("get_block_number(): {err}");
-                    ctx.sleep(RETRY_INTERVAL).await?;
+                    let retry_after = transient_retry.after_error(&err);
+                    tracing::warn!(?retry_after, "main node head request failed");
+                    ctx.sleep(retry_after).await?;
                 }
             }
         }
@@ -250,11 +277,40 @@ impl EN {
         const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
         let n = L2BlockNumber(n.0.try_into().context("overflow")?);
         METRICS.fetch_block.inc();
+        let mut unavailable_retry = time::Duration::milliseconds(100);
+        let mut transient_retry = HttpRetry::default();
         loop {
             match ctx.wait(self.client.sync_l2_block(n, true)).await? {
                 Ok(Some(block)) => return Ok(block.try_into()?),
-                Ok(None) => {}
-                Err(err) if is_retryable(&err) => {}
+                Ok(None) => {
+                    transient_retry = HttpRetry::default();
+                    // The advertised head can precede availability of its sync payload.
+                    // Retry this block promptly without advancing the ordered payload queue.
+                    tracing::info!(
+                        l2_block = n.0,
+                        retry_after = ?unavailable_retry,
+                        "announced main node block is not yet available"
+                    );
+                    ctx.sleep(unavailable_retry).await?;
+                    unavailable_retry = (unavailable_retry + unavailable_retry).min(RETRY_INTERVAL);
+                    continue;
+                }
+                Err(err) if is_transient_http_error(&err) => {
+                    let retry_after = transient_retry.after_error(&err);
+                    tracing::warn!(
+                        l2_block = n.0,
+                        ?retry_after,
+                        "main node sync block request has a transient HTTP failure"
+                    );
+                    ctx.sleep(retry_after).await?;
+                    continue;
+                }
+                Err(err) if is_retryable(&err) => {
+                    tracing::warn!(
+                        l2_block = n.0,
+                        "retryable main node sync block request failure; retrying in five seconds"
+                    );
+                }
                 Err(err) => Err(err).with_context(|| format!("client.sync_l2_block({n})"))?,
             }
             ctx.sleep(RETRY_INTERVAL).await?;
@@ -322,5 +378,223 @@ impl EN {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use zksync_contracts::BaseSystemContractsHashes;
+    use zksync_types::{api::en::SyncBlock, L1BatchNumber, ProtocolVersionId, H256};
+    use zksync_web3_decl::{client::MockClient, jsonrpsee::core::ClientError};
+
+    use super::*;
+
+    fn block() -> SyncBlock {
+        SyncBlock {
+            number: L2BlockNumber(42),
+            l1_batch_number: L1BatchNumber(1),
+            last_in_batch: true,
+            timestamp: 1,
+            l1_gas_price: 1,
+            l2_fair_gas_price: 1,
+            fair_pubdata_price: Some(1),
+            base_system_contracts_hashes: BaseSystemContractsHashes {
+                bootloader: H256::zero(),
+                default_aa: H256::zero(),
+                evm_emulator: None,
+            },
+            operator_address: Default::default(),
+            transactions: Some(vec![]),
+            virtual_blocks: Some(1),
+            hash: Some(H256::repeat_byte(42)),
+            protocol_version: ProtocolVersionId::Version30,
+            pubdata_params: Some(zksync_types::commitment::PubdataParams::genesis()),
+            pubdata_limit: None,
+            interop_roots: None,
+            settlement_layer: None,
+            interop_fee: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_unavailable_payload_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, with_transactions: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(with_transactions);
+                    Ok(if count.fetch_add(1, Ordering::Relaxed) < 2 {
+                        None
+                    } else {
+                        Some(block())
+                    })
+                },
+            )
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .expect("an announced block must not wait five seconds for a retry")
+        .unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_preserves_rpc_error_backoff() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |_: L2BlockNumber, _: bool| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Err::<Option<SyncBlock>, _>(ClientError::RequestTimeout)
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_http_503_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, with_transactions: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(with_transactions);
+                    if count.fetch_add(1, Ordering::Relaxed) < 2 {
+                        let error =
+                            zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                                status_code: 503,
+                            };
+                        Err(ClientError::Transport(error.into()))
+                    } else {
+                        Ok(Some(block()))
+                    }
+                },
+            )
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let started = std::time::Instant::now();
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+    }
+
+    #[test]
+    fn test_centralized_fetcher_http_retry_cap_reset_and_cooldown() {
+        let error = |status_code| {
+            ClientError::Transport(
+                zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                    status_code,
+                }
+                .into(),
+            )
+        };
+        let mut retry = HttpRetry::default();
+        for ms in [200, 400, 800, 1600, 3200, 5000, 5000] {
+            assert_eq!(
+                retry.after_error(&error(503)),
+                time::Duration::milliseconds(ms)
+            );
+        }
+        retry = HttpRetry::default();
+        assert_eq!(
+            retry.after_error(&error(503)),
+            time::Duration::milliseconds(200)
+        );
+        assert_eq!(retry.after_error(&error(429)), time::Duration::seconds(5));
+        assert_eq!(
+            retry.after_error(&ClientError::RequestTimeout),
+            time::Duration::seconds(5)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_head_retry_resets_after_success() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("eth_blockNumber", move || {
+                let mut calls = calls.lock().unwrap();
+                calls.push(std::time::Instant::now());
+                if matches!(calls.len(), 1 | 2 | 4) {
+                    Err(ClientError::Transport(
+                        zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                            status_code: 503,
+                        }
+                        .into(),
+                    ))
+                } else {
+                    Ok(zksync_types::U64::from(42))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            node.fetch_state_loop(&ctx)
+        )
+        .await
+        .is_err());
+        let calls = requests.lock().unwrap();
+        assert!(calls.len() >= 5);
+        for (i, minimum, maximum) in [(0, 200, 350), (1, 400, 550), (3, 200, 350)] {
+            let elapsed = calls[i + 1].duration_since(calls[i]);
+            assert!(elapsed >= std::time::Duration::from_millis(minimum));
+            assert!(elapsed < std::time::Duration::from_millis(maximum));
+        }
+        assert_eq!(
+            node.sync_state.borrow().main_node_block(),
+            Some(L2BlockNumber(42))
+        );
     }
 }
