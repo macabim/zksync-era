@@ -251,11 +251,28 @@ impl EN {
         const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
         let n = L2BlockNumber(n.0.try_into().context("overflow")?);
         METRICS.fetch_block.inc();
+        let mut unavailable_retry = time::Duration::milliseconds(100);
         loop {
             match ctx.wait(self.client.sync_l2_block(n, true)).await? {
                 Ok(Some(block)) => return Ok(block.try_into()?),
-                Ok(None) => {}
-                Err(err) if is_retryable(&err) => {}
+                Ok(None) => {
+                    // The advertised head can precede availability of its sync payload.
+                    // Retry this block promptly without advancing the ordered payload queue.
+                    tracing::info!(
+                        l2_block = n.0,
+                        retry_after = ?unavailable_retry,
+                        "announced main node block is not yet available"
+                    );
+                    ctx.sleep(unavailable_retry).await?;
+                    unavailable_retry = (unavailable_retry * 2).min(RETRY_INTERVAL);
+                    continue;
+                }
+                Err(err) if is_retryable(&err) => {
+                    tracing::warn!(
+                        l2_block = n.0,
+                        "retryable main node sync block request failure; retrying in five seconds"
+                    );
+                }
                 Err(err) => Err(err).with_context(|| format!("client.sync_l2_block({n})"))?,
             }
             ctx.sleep(RETRY_INTERVAL).await?;
@@ -323,5 +340,106 @@ impl EN {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use zksync_contracts::BaseSystemContractsHashes;
+    use zksync_types::{api::en::SyncBlock, L1BatchNumber, ProtocolVersionId, H256};
+    use zksync_web3_decl::{client::MockClient, jsonrpsee::core::ClientError};
+
+    use super::*;
+
+    fn block() -> SyncBlock {
+        SyncBlock {
+            number: L2BlockNumber(42),
+            l1_batch_number: L1BatchNumber(1),
+            last_in_batch: true,
+            timestamp: 1,
+            l1_gas_price: 1,
+            l2_fair_gas_price: 1,
+            fair_pubdata_price: Some(1),
+            base_system_contracts_hashes: BaseSystemContractsHashes {
+                bootloader: H256::zero(),
+                default_aa: H256::zero(),
+                evm_emulator: None,
+            },
+            operator_address: Default::default(),
+            transactions: Some(vec![]),
+            virtual_blocks: Some(1),
+            hash: Some(H256::repeat_byte(42)),
+            protocol_version: ProtocolVersionId::Version30,
+            pubdata_params: Some(Default::default()),
+            pubdata_limit: None,
+            interop_roots: None,
+            settlement_layer: None,
+            interop_fee: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_unavailable_payload_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, with_transactions: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(with_transactions);
+                    Ok(if count.fetch_add(1, Ordering::Relaxed) < 2 {
+                        None
+                    } else {
+                        Some(block())
+                    })
+                },
+            )
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .expect("an announced block must not wait five seconds for a retry")
+        .unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_preserves_rpc_error_backoff() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |_: L2BlockNumber, _: bool| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Err::<Option<SyncBlock>, _>(ClientError::RequestTimeout)
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 }
