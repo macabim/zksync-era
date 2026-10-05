@@ -264,7 +264,7 @@ impl EN {
                         "announced main node block is not yet available"
                     );
                     ctx.sleep(unavailable_retry).await?;
-                    unavailable_retry = (unavailable_retry * 2).min(RETRY_INTERVAL);
+                    unavailable_retry = (unavailable_retry + unavailable_retry).min(RETRY_INTERVAL);
                     continue;
                 }
                 Err(err) if is_retryable(&err) => {
