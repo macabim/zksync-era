@@ -372,7 +372,7 @@ mod tests {
             virtual_blocks: Some(1),
             hash: Some(H256::repeat_byte(42)),
             protocol_version: ProtocolVersionId::Version30,
-            pubdata_params: Some(Default::default()),
+            pubdata_params: Some(zksync_types::commitment::PubdataParams::genesis()),
             pubdata_limit: None,
             interop_roots: None,
             settlement_layer: None,
