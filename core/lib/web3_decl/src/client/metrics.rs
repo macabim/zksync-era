@@ -80,6 +80,18 @@ pub(super) static INFO_METRICS: vise::Global<L2ClientInfoMetrics> = vise::Global
 #[derive(Debug, Metrics)]
 #[metrics(prefix = "l2_client")]
 pub(super) struct L2ClientMetrics {
+    /// Number of logical sync reads with duplicate protection enabled.
+    #[metrics(labels = ["method"])]
+    pub sync_requests: LabeledFamily<String, Counter>,
+    /// Number of duplicate sync reads sent on separate connections.
+    #[metrics(labels = ["method"])]
+    pub hedged_requests: LabeledFamily<String, Counter>,
+    /// Number of duplicate responses selected before the primary response.
+    #[metrics(labels = ["method"])]
+    pub hedge_wins: LabeledFamily<String, Counter>,
+    /// Duration of logical sync reads, including duplicate connection setup.
+    #[metrics(buckets = Buckets::LATENCIES, unit = Unit::Seconds, labels = ["method"])]
+    pub sync_request_latency: LabeledFamily<String, Histogram<Duration>>,
     /// Number of requests timed out in the rate-limiting logic.
     #[metrics(labels = ["method"])]
     pub rate_limit_timeout: LabeledFamily<String, Counter>,

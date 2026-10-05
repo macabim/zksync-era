@@ -264,3 +264,277 @@ async fn wrapping_mock_client() {
     };
     assert!(metrics.http_errors.contains(&labels), "{metrics:?}");
 }
+
+// A real HTTP server checks connection independence and the exact request body.
+// Drop aborts the listener and all connection tasks, including stalled responses.
+struct SyncHttpServer {
+    url: SensitiveUrl,
+    requests: Arc<Mutex<Vec<(usize, serde_json::Value, Instant)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for SyncHttpServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl SyncHttpServer {
+    async fn new(
+        reply: impl Fn(usize) -> (Duration, u16, serde_json::Value) + Send + Sync + 'static,
+    ) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let reply = Arc::new(reply);
+        let task = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            let mut connection = 0;
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                connection += 1;
+                let connection = connection;
+                let recorded = recorded.clone();
+                let reply = reply.clone();
+                connections.spawn(async move {
+                    let mut data = Vec::new();
+                    loop {
+                        let header_end = loop {
+                            if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                                break end + 4;
+                            }
+                            let mut buffer = [0; 4096];
+                            let Ok(n) = socket.read(&mut buffer).await else { return };
+                            if n == 0 { return; }
+                            data.extend_from_slice(&buffer[..n]);
+                        };
+                        let headers = String::from_utf8_lossy(&data[..header_end]).to_lowercase();
+                        let length: usize = headers.lines().find_map(|line| line.strip_prefix("content-length: ")).unwrap().parse().unwrap();
+                        while data.len() < header_end + length {
+                            let mut buffer = [0; 4096];
+                            let Ok(n) = socket.read(&mut buffer).await else { return };
+                            if n == 0 { return; }
+                            data.extend_from_slice(&buffer[..n]);
+                        }
+                        let body: serde_json::Value = serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                        data.drain(..header_end + length);
+                        let index = {
+                            let mut recorded = recorded.lock().unwrap();
+                            let index = recorded.len();
+                            recorded.push((connection, body.clone(), Instant::now()));
+                            index
+                        };
+                        let (delay, status, value) = reply(index);
+                        tokio::time::sleep(delay).await;
+                        let body = serde_json::json!({"jsonrpc":"2.0", "id":body["id"], "result":value}).to_string();
+                        let response = format!("HTTP/1.1 {status} Response\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}", body.len());
+                        if socket.write_all(response.as_bytes()).await.is_err() { return; }
+                    }
+                });
+            }
+        });
+        Self {
+            url,
+            requests,
+            task,
+        }
+    }
+
+    fn client(&self) -> Client<L2> {
+        Client::http(self.url.clone())
+            .unwrap()
+            .report_config(false)
+            .with_sync_request_hedging()
+            .build()
+    }
+}
+
+#[tokio::test]
+async fn sync_hedge_uses_independent_connection_and_exact_parameters() {
+    let server = SyncHttpServer::new(|index| {
+        (
+            if index == 0 {
+                Duration::from_secs(8)
+            } else {
+                Duration::ZERO
+            },
+            200,
+            serde_json::json!({"number":42, "hash":"exact-block"}),
+        )
+    })
+    .await;
+    let client = server.client();
+    let start = Instant::now();
+    let value: serde_json::Value = tokio::time::timeout(
+        Duration::from_secs(2),
+        client.request("en_syncL2Block", rpc_params![42, true]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(value["number"], 42);
+    assert_eq!(value["hash"], "exact-block");
+    assert!(start.elapsed() < Duration::from_secs(1));
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_ne!(requests[0].0, requests[1].0);
+    assert_eq!(requests[0].1["params"], serde_json::json!([42, true]));
+    assert_eq!(requests[0].1["params"], requests[1].1["params"]);
+    assert!(requests[1].2.duration_since(requests[0].2) >= Duration::from_millis(190));
+}
+
+#[tokio::test]
+async fn sync_hedge_preserves_null_and_http_errors_without_duplicates() {
+    for status in [200, 429, 503] {
+        let server =
+            SyncHttpServer::new(move |_| (Duration::ZERO, status, serde_json::Value::Null)).await;
+        let result = server
+            .client()
+            .request::<Option<serde_json::Value>, _>("en_syncL2Block", rpc_params![42, true])
+            .await;
+        if status == 200 {
+            assert_eq!(result.unwrap(), None);
+        } else {
+            assert_matches!(result, Err(Error::Transport(err)) if matches!(err.downcast_ref::<transport::Error>(), Some(transport::Error::Rejected { status_code }) if *status_code == status));
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn sync_hedge_never_duplicates_transaction_submission() {
+    let server = SyncHttpServer::new(|_| {
+        (
+            Duration::from_millis(250),
+            200,
+            serde_json::json!("tx-hash"),
+        )
+    })
+    .await;
+    let client = server.client();
+    let value: String = client
+        .request("eth_sendRawTransaction", rpc_params!["0xabcd"])
+        .await
+        .unwrap();
+    assert_eq!(value, "tx-hash");
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sync_hedge_shares_rate_limit_with_primary_and_clones() {
+    let server =
+        SyncHttpServer::new(|_| (Duration::from_secs(8), 200, serde_json::json!("0x2a"))).await;
+    let mut client = server.client();
+    client.rate_limit = SharedRateLimit::new(1, Duration::from_secs(1));
+    let clone = client.clone();
+    let calls = async {
+        tokio::join!(
+            client.request::<String, _>("eth_blockNumber", rpc_params![]),
+            clone.request::<String, _>("eth_blockNumber", rpc_params![])
+        )
+    };
+    assert!(tokio::time::timeout(Duration::from_millis(3300), calls)
+        .await
+        .is_err());
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    for pair in requests.windows(2) {
+        assert!(pair[1].2.duration_since(pair[0].2) >= Duration::from_millis(950));
+    }
+    assert_eq!(
+        requests.iter().map(|r| r.0).collect::<HashSet<_>>().len(),
+        4
+    );
+}
+
+#[tokio::test]
+async fn sync_hedge_cancels_primary_and_creates_at_most_one_duplicate() {
+    struct Cancel(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for Cancel {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let canceled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = canceled.clone();
+    let primary = MockClient::builder(L2::default())
+        .method("eth_blockNumber", move || {
+            let guard = Cancel(counter.clone());
+            async move {
+                let _guard = guard;
+                future::pending::<Result<serde_json::Value, Error>>().await
+            }
+        })
+        .build();
+    let server = SyncHttpServer::new(|_| (Duration::ZERO, 200, serde_json::json!("0x2a"))).await;
+    let mut client = ClientBuilder::<L2, _>::new(primary, server.url.clone())
+        .report_config(false)
+        .build();
+    client.sync_hedge_delay = Some(Duration::from_millis(200));
+    assert_eq!(
+        client
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+            .await
+            .unwrap(),
+        "0x2a"
+    );
+    assert_eq!(canceled.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+
+    let slow =
+        SyncHttpServer::new(|_| (Duration::from_secs(8), 200, serde_json::json!("0x2a"))).await;
+    assert!(tokio::time::timeout(
+        Duration::from_secs(1),
+        slow.client()
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+    )
+    .await
+    .is_err());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(slow.requests.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn sync_hedge_remains_disabled_by_default() {
+    let server =
+        SyncHttpServer::new(|_| (Duration::from_millis(250), 200, serde_json::json!("0x2a"))).await;
+    let client = Client::<L2>::http(server.url.clone())
+        .unwrap()
+        .report_config(false)
+        .build();
+    assert_eq!(
+        client
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+            .await
+            .unwrap(),
+        "0x2a"
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn sync_hedge_preserves_fatal_rpc_errors() {
+    let server = SyncHttpServer::new(|_| (Duration::ZERO, 200, serde_json::json!("0x2a"))).await;
+    let primary = MockClient::builder(L2::default())
+        .method("en_syncL2Block", |_: u32, _: bool| {
+            Err::<serde_json::Value, _>(Error::Call(jsonrpsee::types::ErrorObjectOwned::owned(
+                -32602,
+                "invalid block",
+                None::<()>,
+            )))
+        })
+        .build();
+    let mut client = ClientBuilder::<L2, _>::new(primary, server.url.clone())
+        .report_config(false)
+        .build();
+    client.sync_hedge_delay = Some(Duration::from_millis(200));
+    assert_matches!(client.request::<serde_json::Value, _>("en_syncL2Block", rpc_params![42, true]).await,
+        Err(Error::Call(error)) if error.code() == -32602);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(server.requests.lock().unwrap().is_empty());
+}

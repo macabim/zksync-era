@@ -53,11 +53,18 @@ impl WiringLayer for MainNodeClientLayer {
     }
 
     async fn wire(self, input: Self::Input) -> Result<Self::Output, WiringError> {
-        let main_node_client = Client::http(self.url)
+        let builder = Client::http(self.url)
             .context("failed creating JSON-RPC client for main node")?
             .for_network(self.l2_chain_id.into())
-            .with_allowed_requests_per_second(self.rate_limit_rps)
-            .build();
+            .with_allowed_requests_per_second(self.rate_limit_rps);
+        // Abstract upstream sync reads have isolated multi-second HTTP stalls.
+        // Keep transaction submission and other networks on the normal transport.
+        let builder = if self.l2_chain_id.as_u64() == 2741 {
+            builder.with_sync_request_hedging()
+        } else {
+            builder
+        };
+        let main_node_client = builder.build();
 
         let client = Box::new(main_node_client) as Box<DynClient<L2>>;
 
