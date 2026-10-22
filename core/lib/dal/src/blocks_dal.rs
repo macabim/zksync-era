@@ -4240,7 +4240,11 @@ mod tests {
             .unwrap();
         let heaps = [
             vec![],
-            vec![(0, U256::zero()), (usize::MAX, U256::MAX), (17, U256::from(42))],
+            vec![
+                (0, U256::zero()),
+                (usize::MAX, U256::MAX),
+                (17, U256::from(42)),
+            ],
             (0..150_000).map(|i| (i, U256::from(i) << 192)).collect(),
         ];
         for (i, heap) in heaps.into_iter().enumerate() {
@@ -4248,48 +4252,91 @@ mod tests {
             header.number = L1BatchNumber(i as u32 + 1);
             header.pubdata_input = Some(vec![0, 1, 255]);
             let mut tx = conn.start_transaction().await.unwrap();
-            tx.blocks_dal().insert_l1_batch(header.to_unsealed_header()).await.unwrap();
-            tx.blocks_dal().mark_l1_batch_as_sealed(
-                &header, &heap, &[0, u32::MAX], &[i32::MIN, i32::MAX],
-                Default::default(), 1, U256::zero(),
-            ).await.unwrap();
-            assert_eq!(tx.blocks_dal().get_initial_bootloader_heap(header.number).await.unwrap(), Some(heap.clone()));
+            tx.blocks_dal()
+                .insert_l1_batch(header.to_unsealed_header())
+                .await
+                .unwrap();
+            tx.blocks_dal()
+                .mark_l1_batch_as_sealed(
+                    &header,
+                    &heap,
+                    &[0, u32::MAX],
+                    &[i32::MIN, i32::MAX],
+                    Default::default(),
+                    1,
+                    U256::zero(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                tx.blocks_dal()
+                    .get_initial_bootloader_heap(header.number)
+                    .await
+                    .unwrap(),
+                Some(heap.clone())
+            );
             tx.commit().await.unwrap();
-            assert_eq!(conn.blocks_dal().get_initial_bootloader_heap(header.number).await.unwrap(), Some(heap));
+            assert_eq!(
+                conn.blocks_dal()
+                    .get_initial_bootloader_heap(header.number)
+                    .await
+                    .unwrap(),
+                Some(heap)
+            );
         }
     }
 
     #[test]
     #[ignore = "Run with --ignored --nocapture and ABSTRACT_HEAP_SAMPLE for a captured batch"]
     fn benchmark_heap_encoding() {
-        use std::{hint::black_box, time::Instant};
         use sqlx::{Encode, Postgres};
+        use std::{hint::black_box, time::Instant};
         let sample = std::env::var("ABSTRACT_HEAP_SAMPLE").unwrap();
-        let heap: Vec<(usize, U256)> = serde_json::from_reader(std::fs::File::open(sample).unwrap()).unwrap();
+        let heap: Vec<(usize, U256)> =
+            serde_json::from_reader(std::fs::File::open(sample).unwrap()).unwrap();
         let mut old_times = Vec::new();
         let mut new_times = Vec::new();
         for iteration in 0..12 {
             let mut outputs = Vec::new();
-            for old in if iteration % 2 == 0 { [true, false] } else { [false, true] } {
+            for old in if iteration % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
                 let start = Instant::now();
                 let mut buffer = sqlx::postgres::PgArgumentBuffer::default();
                 if old {
                     let copy = heap.clone();
                     let value = serde_json::to_value(&copy).unwrap();
-                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(&sqlx::types::Json(value), &mut buffer).unwrap();
+                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
+                        &sqlx::types::Json(value),
+                        &mut buffer,
+                    )
+                    .unwrap();
                 } else {
-                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(&sqlx::types::Json(heap.as_slice()), &mut buffer).unwrap();
+                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
+                        &sqlx::types::Json(heap.as_slice()),
+                        &mut buffer,
+                    )
+                    .unwrap();
                 }
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                 black_box(&buffer);
                 if iteration > 1 {
-                    if old { old_times.push(elapsed); } else { new_times.push(elapsed); }
+                    if old {
+                        old_times.push(elapsed);
+                    } else {
+                        new_times.push(elapsed);
+                    }
                 }
                 outputs.push(buffer.to_vec());
             }
             assert_eq!(outputs[0], outputs[1]);
         }
-        println!("heap_words={} old_ms={old_times:?} direct_ms={new_times:?}", heap.len());
+        println!(
+            "heap_words={} old_ms={old_times:?} direct_ms={new_times:?}",
+            heap.len()
+        );
     }
 
     #[tokio::test]
