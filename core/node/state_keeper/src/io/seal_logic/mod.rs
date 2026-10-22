@@ -142,14 +142,14 @@ impl UpdatesManager {
 
         let final_bootloader_memory = finished_batch
             .final_bootloader_memory
-            .clone()
+            .as_deref()
             .unwrap_or_default();
 
         transaction
             .blocks_dal()
             .mark_l1_batch_as_sealed(
                 &l1_batch,
-                &final_bootloader_memory,
+                final_bootloader_memory,
                 &finished_batch.final_execution_state.storage_refunds,
                 &finished_batch.final_execution_state.pubdata_costs,
                 self.pending_execution_metrics().circuit_statistic,
