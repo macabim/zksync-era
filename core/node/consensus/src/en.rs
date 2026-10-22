@@ -22,7 +22,7 @@ use crate::{
     storage::{self, ConnectionPool},
 };
 
-/// Backoff for transient HTTP failures. Other errors retain the five-second cooldown.
+/// Backoff for transient HTTP failures and head timeouts. Other errors retain the five-second cooldown.
 struct HttpRetry(time::Duration);
 
 impl Default for HttpRetry {
@@ -37,7 +37,12 @@ impl HttpRetry {
         error: &zksync_web3_decl::jsonrpsee::core::ClientError,
     ) -> time::Duration {
         const MAX: time::Duration = time::Duration::seconds(5);
-        if !is_transient_http_error(error) {
+        if !is_transient_http_error(error)
+            && !matches!(
+                error,
+                zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+            )
+        {
             return MAX;
         }
         let delay = self.0;
@@ -548,12 +553,21 @@ mod tests {
         assert_eq!(retry.after_error(&error(429)), time::Duration::seconds(5));
         assert_eq!(
             retry.after_error(&ClientError::RequestTimeout),
-            time::Duration::seconds(5)
+            time::Duration::milliseconds(400)
         );
     }
 
     #[tokio::test]
     async fn test_centralized_fetcher_head_retry_resets_after_success() {
+        check_head_retry_resets_after_success(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_head_timeout_retries_promptly() {
+        check_head_retry_resets_after_success(true).await;
+    }
+
+    async fn check_head_retry_resets_after_success(timeout: bool) {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls = requests.clone();
         let client = MockClient::builder(L2::default())
@@ -561,6 +575,9 @@ mod tests {
                 let mut calls = calls.lock().unwrap();
                 calls.push(std::time::Instant::now());
                 if matches!(calls.len(), 1 | 2 | 4) {
+                    if timeout {
+                        return Err(ClientError::RequestTimeout);
+                    }
                     Err(ClientError::Transport(
                         zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
                             status_code: 503,
