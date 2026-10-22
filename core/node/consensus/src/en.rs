@@ -457,6 +457,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_centralized_fetcher_cancels_stalled_payload_before_retry() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let in_flight = active.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |_: L2BlockNumber, _: bool| {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let active = in_flight.clone();
+                async move {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    let _guard = Active(active);
+                    if first {
+                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    }
+                    Ok(Some(block()))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn test_centralized_fetcher_payload_deadline_expands_for_large_response() {
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();

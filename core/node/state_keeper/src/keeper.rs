@@ -291,7 +291,7 @@ impl StateKeeperInner {
         stop_receiver: &mut watch::Receiver<bool>,
     ) -> Result<InitializedBatchState, OrStopped> {
         // Prepare the previous batch's committed state while the next payload is fetched.
-        // Join both operations: no cache updater can outlive this batch transition.
+        // Join both operations without creating a detached preparation task.
         let storage_factory = self.storage_factory.clone();
         let storage_stop = stop_receiver.clone();
         let (batch_init_params, storage) = tokio::try_join!(
@@ -1292,5 +1292,48 @@ mod storage_preparation_tests {
         .await
         .expect("storage must be prepared while waiting for batch params")
         .unwrap();
+    }
+    #[derive(Debug)]
+    struct PendingStorage(Arc<Notify>);
+
+    #[async_trait::async_trait]
+    impl ReadStorageFactory for PendingStorage {
+        async fn access_storage(
+            &self,
+            stop: &watch::Receiver<bool>,
+            _: L1BatchNumber,
+        ) -> Result<OwnedStorage, OrStopped> {
+            self.0.notify_one();
+            let mut stop = stop.clone();
+            stop.changed().await.unwrap();
+            Err(OrStopped::Stopped)
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_pending_storage_preparation() {
+        let scenario = TestScenario::new();
+        let executor = TestBatchExecutorBuilder::new(&scenario);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (mut io, output) = TestIO::new(stop_tx.clone(), scenario);
+        let (cursor, _) = io.initialize().await.unwrap();
+        let entered = Arc::new(Notify::new());
+        let mut inner = StateKeeperInner::from(StateKeeperBuilder::new(
+            Box::new(io),
+            Box::new(executor),
+            output,
+            Arc::new(SequencerSealer::for_tests()),
+            Arc::new(PendingStorage(entered.clone())),
+            None,
+        ));
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(inner.start_batch(cursor, &mut stop_rx), async {
+                entered.notified().await;
+                stop_tx.send(true).unwrap();
+            })
+        })
+        .await
+        .expect("shutdown must stop preparation");
+        assert!(matches!(result, Err(OrStopped::Stopped)));
     }
 }
