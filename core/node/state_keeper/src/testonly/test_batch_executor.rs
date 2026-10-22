@@ -665,6 +665,7 @@ impl StateKeeperOutputHandler for TestPersistence {
 }
 
 pub(crate) struct TestIO {
+    pub(crate) batch_params_gate: Option<Arc<tokio::sync::Notify>>,
     stop_sender: Arc<watch::Sender<bool>>,
     batch_number: L1BatchNumber,
     timestamp: u64,
@@ -714,6 +715,7 @@ impl TestIO {
             (L2BlockNumber(1), 1)
         };
         let this = Self {
+            batch_params_gate: None,
             stop_sender,
             batch_number: L1BatchNumber(1),
             timestamp,
@@ -811,6 +813,9 @@ impl StateKeeperIO for TestIO {
     ) -> anyhow::Result<Option<L1BatchParams>> {
         assert_eq!(cursor.next_l2_block, self.l2_block_number);
         assert_eq!(cursor.l1_batch, self.batch_number);
+        if let Some(gate) = self.batch_params_gate.take() {
+            gate.notified().await;
+        }
 
         let params = L1BatchParams {
             protocol_version: self.protocol_version,
