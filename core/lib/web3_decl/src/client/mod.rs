@@ -233,6 +233,10 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
         let label = method.to_owned();
         let started = Instant::now();
         self.metrics.sync_requests[&label].inc();
+        // Head responses are small. If both connections stall, let the fetcher retry
+        // instead of holding every subsequent block behind this request.
+        let head_deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(head_deadline);
         let primary = async {
             self.inspect_call_result(origin, self.inner.request(method, params.clone()).await)
         };
@@ -256,6 +260,9 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
                 tokio::select! {
                     biased;
                     result = &mut primary => result,
+                    _ = &mut head_deadline, if method == "eth_blockNumber" => {
+                        self.inspect_call_result(origin, Err(Error::RequestTimeout))
+                    }
                     result = &mut duplicate => {
                         self.metrics.hedge_wins[&label].inc();
                         result

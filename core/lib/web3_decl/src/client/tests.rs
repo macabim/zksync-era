@@ -434,8 +434,8 @@ async fn sync_hedge_shares_rate_limit_with_primary_and_clones() {
     let clone = client.clone();
     let calls = async {
         tokio::join!(
-            client.request::<String, _>("eth_blockNumber", rpc_params![]),
-            clone.request::<String, _>("eth_blockNumber", rpc_params![])
+            client.request::<String, _>("en_syncL2Block", rpc_params![42, true]),
+            clone.request::<String, _>("en_syncL2Block", rpc_params![42, true])
         )
     };
     assert!(tokio::time::timeout(Duration::from_millis(3300), calls)
@@ -488,13 +488,16 @@ async fn sync_hedge_cancels_primary_and_creates_at_most_one_duplicate() {
 
     let slow =
         SyncHttpServer::new(|_| (Duration::from_secs(8), 200, serde_json::json!("0x2a"))).await;
-    assert!(tokio::time::timeout(
-        Duration::from_secs(1),
-        slow.client()
-            .request::<String, _>("eth_blockNumber", rpc_params![])
-    )
-    .await
-    .is_err());
+    assert_matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            slow.client()
+                .request::<String, _>("eth_blockNumber", rpc_params![])
+        )
+        .await
+        .unwrap(),
+        Err(Error::RequestTimeout)
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(slow.requests.lock().unwrap().len(), 2);
 }
@@ -537,4 +540,64 @@ async fn sync_hedge_preserves_fatal_rpc_errors() {
         Err(Error::Call(error)) if error.code() == -32602);
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(server.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn head_deadline_recovers_when_both_connections_stall() {
+    let server = SyncHttpServer::new(|index| {
+        (
+            if index < 2 {
+                Duration::from_secs(8)
+            } else {
+                Duration::ZERO
+            },
+            200,
+            serde_json::json!("0x2a"),
+        )
+    })
+    .await;
+    let client = server.client();
+    let started = Instant::now();
+    assert_matches!(
+        client
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+            .await,
+        Err(Error::RequestTimeout)
+    );
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        client
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+            .await
+            .unwrap(),
+        "0x2a"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    assert_eq!(server.requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn head_deadline_does_not_cancel_large_sync_payloads() {
+    let server = SyncHttpServer::new(|_| {
+        (
+            Duration::from_millis(1200),
+            200,
+            serde_json::json!({"number": 42}),
+        )
+    })
+    .await;
+    let started = Instant::now();
+    let value: serde_json::Value = tokio::time::timeout(
+        Duration::from_secs(3),
+        server
+            .client()
+            .request("en_syncL2Block", rpc_params![42, true]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(value["number"], 42);
+    assert!(started.elapsed() >= Duration::from_millis(1200));
+    assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
