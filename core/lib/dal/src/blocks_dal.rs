@@ -4308,13 +4308,13 @@ mod tests {
                 if old {
                     let copy = heap.clone();
                     let value = serde_json::to_value(&copy).unwrap();
-                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
+                    let _ = <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
                         &sqlx::types::Json(value),
                         &mut buffer,
                     )
                     .unwrap();
                 } else {
-                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
+                    let _ = <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(
                         &sqlx::types::Json(heap.as_slice()),
                         &mut buffer,
                     )
