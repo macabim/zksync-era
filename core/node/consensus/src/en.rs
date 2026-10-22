@@ -284,8 +284,28 @@ impl EN {
         METRICS.fetch_block.inc();
         let mut unavailable_retry = time::Duration::milliseconds(100);
         let mut transient_retry = HttpRetry::default();
+        // Retry a stalled payload promptly, but expand the budget for large responses.
+        // This deadline covers both hedged connections; dropping the future cancels both.
+        let mut payload_deadline = std::time::Duration::from_secs(2);
         loop {
-            match ctx.wait(self.client.sync_l2_block(n, true)).await? {
+            let result = ctx
+                .wait(tokio::time::timeout(
+                    payload_deadline,
+                    self.client.sync_l2_block(n, true),
+                ))
+                .await?;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        l2_block = n.0,
+                        ?payload_deadline,
+                        "main node sync block deadline expired"
+                    );
+                    Err(zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout)
+                }
+            };
+            match result {
                 Ok(Some(block)) => return Ok(block.try_into()?),
                 Ok(None) => {
                     transient_retry = HttpRetry::default();
@@ -300,12 +320,25 @@ impl EN {
                     unavailable_retry = (unavailable_retry + unavailable_retry).min(RETRY_INTERVAL);
                     continue;
                 }
-                Err(err) if is_transient_http_error(&err) => {
+                Err(err)
+                    if is_transient_http_error(&err)
+                        || matches!(
+                            err,
+                            zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+                        ) =>
+                {
+                    if matches!(
+                        err,
+                        zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+                    ) {
+                        payload_deadline =
+                            (payload_deadline * 2).min(std::time::Duration::from_secs(60));
+                    }
                     let retry_after = transient_retry.after_error(&err);
                     tracing::warn!(
                         l2_block = n.0,
                         ?retry_after,
-                        "main node sync block request has a transient HTTP failure"
+                        "main node sync block request failed transiently"
                     );
                     ctx.sleep(retry_after).await?;
                     continue;
@@ -424,6 +457,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_centralized_fetcher_payload_deadline_expands_for_large_response() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |number: L2BlockNumber, _: bool| {
+                count.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(number, L2BlockNumber(42));
+                    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                    Ok(Some(block()))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let started = std::time::Instant::now();
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(6),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(4700));
+    }
+
+    #[tokio::test]
     async fn test_centralized_fetcher_retries_unavailable_payload_promptly() {
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
@@ -461,7 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_centralized_fetcher_preserves_rpc_error_backoff() {
+    async fn test_centralized_fetcher_retries_payload_timeout_promptly() {
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
         let client = MockClient::builder(L2::default())
@@ -483,7 +550,7 @@ mod tests {
         )
         .await
         .is_err());
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
     #[tokio::test]
     async fn test_centralized_fetcher_retries_http_503_promptly() {

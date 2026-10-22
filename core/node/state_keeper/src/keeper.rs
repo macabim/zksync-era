@@ -290,9 +290,14 @@ impl StateKeeperInner {
         cursor: IoCursor,
         stop_receiver: &mut watch::Receiver<bool>,
     ) -> Result<InitializedBatchState, OrStopped> {
-        let batch_init_params = self
-            .wait_for_new_batch_init_params(&cursor, stop_receiver)
-            .await?;
+        // Prepare the previous batch's committed state while the next payload is fetched.
+        // Join both operations: no cache updater can outlive this batch transition.
+        let storage_factory = self.storage_factory.clone();
+        let storage_stop = stop_receiver.clone();
+        let (batch_init_params, storage) = tokio::try_join!(
+            self.wait_for_new_batch_init_params(&cursor, stop_receiver),
+            storage_factory.access_storage(&storage_stop, cursor.l1_batch - 1),
+        )?;
         let first_batch_in_shared_bridge = batch_init_params.l1_batch_env.number
             == L1BatchNumber(1)
             && !batch_init_params.system_env.version.is_pre_shared_bridge();
@@ -307,14 +312,12 @@ impl StateKeeperInner {
             Some(cursor.prev_l2_block_timestamp),
             !self.leader_rotation,
         );
-        let batch_executor = self
-            .create_batch_executor(
-                batch_init_params.l1_batch_env.clone(),
-                batch_init_params.system_env.clone(),
-                batch_init_params.pubdata_params,
-                stop_receiver,
-            )
-            .await?;
+        let batch_executor = self.batch_executor_factory.init_batch(
+            storage,
+            batch_init_params.l1_batch_env.clone(),
+            batch_init_params.system_env.clone(),
+            batch_init_params.pubdata_params,
+        );
 
         let version_changed =
             batch_init_params.system_env.version != previous_batch_protocol_version;
@@ -1234,5 +1237,60 @@ impl StateKeeper {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod storage_preparation_tests {
+    use super::*;
+    use crate::{
+        seal_criteria::SequencerSealer,
+        testonly::test_batch_executor::{
+            MockReadStorageFactory, TestBatchExecutorBuilder, TestIO, TestScenario,
+        },
+    };
+    use tokio::sync::Notify;
+
+    #[derive(Debug)]
+    struct GatedStorage(Arc<Notify>);
+
+    #[async_trait::async_trait]
+    impl ReadStorageFactory for GatedStorage {
+        async fn access_storage(
+            &self,
+            stop: &watch::Receiver<bool>,
+            batch: L1BatchNumber,
+        ) -> Result<OwnedStorage, OrStopped> {
+            assert_eq!(batch, L1BatchNumber(0));
+            self.0.notify_one();
+            MockReadStorageFactory.access_storage(stop, batch).await
+        }
+    }
+
+    #[tokio::test]
+    async fn prepares_storage_before_next_batch_params_arrive() {
+        let scenario = TestScenario::new();
+        let executor = TestBatchExecutorBuilder::new(&scenario);
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let (mut io, output) = TestIO::new(stop_tx, scenario);
+        let gate = Arc::new(Notify::new());
+        io.batch_params_gate = Some(gate.clone());
+        let (cursor, _) = io.initialize().await.unwrap();
+        let mut inner = StateKeeperInner::from(StateKeeperBuilder::new(
+            Box::new(io),
+            Box::new(executor),
+            output,
+            Arc::new(SequencerSealer::for_tests()),
+            Arc::new(GatedStorage(gate)),
+            None,
+        ));
+        // Sequential preparation deadlocks: the params wait until storage starts.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            inner.start_batch(cursor, &mut stop_rx),
+        )
+        .await
+        .expect("storage must be prepared while waiting for batch params")
+        .unwrap();
     }
 }
