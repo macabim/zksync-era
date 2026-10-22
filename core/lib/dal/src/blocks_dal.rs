@@ -1270,16 +1270,15 @@ impl BlocksDal<'_, '_> {
             .iter()
             .map(|log| log.0.to_bytes().to_vec())
             .collect::<Vec<Vec<u8>>>();
-        let pubdata_input = header.pubdata_input.clone();
-        let initial_bootloader_contents = serde_json::to_value(initial_bootloader_contents)
-            .map_err(|err| instrumentation.arg_error("initial_bootloader_contents", err))?;
+        let pubdata_input = header.pubdata_input.as_deref();
+        // Encode the heap directly. A JSON value tree duplicates this large batch payload.
+        let initial_bootloader_contents = sqlx::types::Json(initial_bootloader_contents);
         let used_contract_hashes = serde_json::to_value(&header.used_contract_hashes)
             .map_err(|err| instrumentation.arg_error("header.used_contract_hashes", err))?;
         let storage_refunds: Vec<_> = storage_refunds.iter().copied().map(i64::from).collect();
         let pubdata_costs: Vec<_> = pubdata_costs.iter().copied().map(i64::from).collect();
 
         let blobs_amount = pubdata_input
-            .clone()
             .map(|input| input.len() as u64)
             .unwrap_or(0)
             .div_ceil(bytes_per_blob);
@@ -1319,7 +1318,7 @@ impl BlocksDal<'_, '_> {
             &header.l2_to_l1_messages,
             header.bloom.as_bytes(),
             &priority_onchain_data,
-            initial_bootloader_contents,
+            initial_bootloader_contents as _,
             used_contract_hashes,
             header.base_system_contracts_hashes.bootloader.as_bytes(),
             header.base_system_contracts_hashes.default_aa.as_bytes(),
@@ -4229,6 +4228,68 @@ mod tests {
             .insert_mock_l1_batch(header)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn sealed_heap_roundtrip() {
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = pool.connection().await.unwrap();
+        conn.protocol_versions_dal()
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
+        let heaps = [
+            vec![],
+            vec![(0, U256::zero()), (usize::MAX, U256::MAX), (17, U256::from(42))],
+            (0..150_000).map(|i| (i, U256::from(i) << 192)).collect(),
+        ];
+        for (i, heap) in heaps.into_iter().enumerate() {
+            let mut header = mock_l1_batch_header();
+            header.number = L1BatchNumber(i as u32 + 1);
+            header.pubdata_input = Some(vec![0, 1, 255]);
+            let mut tx = conn.start_transaction().await.unwrap();
+            tx.blocks_dal().insert_l1_batch(header.to_unsealed_header()).await.unwrap();
+            tx.blocks_dal().mark_l1_batch_as_sealed(
+                &header, &heap, &[0, u32::MAX], &[i32::MIN, i32::MAX],
+                Default::default(), 1, U256::zero(),
+            ).await.unwrap();
+            assert_eq!(tx.blocks_dal().get_initial_bootloader_heap(header.number).await.unwrap(), Some(heap.clone()));
+            tx.commit().await.unwrap();
+            assert_eq!(conn.blocks_dal().get_initial_bootloader_heap(header.number).await.unwrap(), Some(heap));
+        }
+    }
+
+    #[test]
+    #[ignore = "Run with --ignored --nocapture and ABSTRACT_HEAP_SAMPLE for a captured batch"]
+    fn benchmark_heap_encoding() {
+        use std::{hint::black_box, time::Instant};
+        use sqlx::{Encode, Postgres};
+        let sample = std::env::var("ABSTRACT_HEAP_SAMPLE").unwrap();
+        let heap: Vec<(usize, U256)> = serde_json::from_reader(std::fs::File::open(sample).unwrap()).unwrap();
+        let mut old_times = Vec::new();
+        let mut new_times = Vec::new();
+        for iteration in 0..12 {
+            let mut outputs = Vec::new();
+            for old in if iteration % 2 == 0 { [true, false] } else { [false, true] } {
+                let start = Instant::now();
+                let mut buffer = sqlx::postgres::PgArgumentBuffer::default();
+                if old {
+                    let copy = heap.clone();
+                    let value = serde_json::to_value(&copy).unwrap();
+                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(&sqlx::types::Json(value), &mut buffer).unwrap();
+                } else {
+                    <sqlx::types::Json<_> as Encode<Postgres>>::encode_by_ref(&sqlx::types::Json(heap.as_slice()), &mut buffer).unwrap();
+                }
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                black_box(&buffer);
+                if iteration > 1 {
+                    if old { old_times.push(elapsed); } else { new_times.push(elapsed); }
+                }
+                outputs.push(buffer.to_vec());
+            }
+            assert_eq!(outputs[0], outputs[1]);
+        }
+        println!("heap_words={} old_ms={old_times:?} direct_ms={new_times:?}", heap.len());
     }
 
     #[tokio::test]
