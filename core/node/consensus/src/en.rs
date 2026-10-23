@@ -511,6 +511,15 @@ mod tests {
     async fn test_centralized_fetcher_queues_payloads_with_frozen_head() {
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let seen = requests.clone();
+        let transaction = zksync_test_contracts::Account::random().get_l2_tx_for_execute(
+            zksync_types::Execute {
+                contract_address: Some(Default::default()),
+                calldata: vec![],
+                value: Default::default(),
+                factory_deps: vec![],
+            },
+            None,
+        );
         let client = MockClient::builder(L2::default())
             .method("en_syncL2Block", move |number: L2BlockNumber, _: bool| {
                 seen.lock().unwrap().push(number.0);
@@ -521,6 +530,7 @@ mod tests {
                 payload.number = number;
                 payload.timestamp = u64::from(number.0);
                 payload.last_in_batch = false;
+                payload.transactions = Some(vec![transaction.clone()]);
                 Ok(Some(payload))
             })
             .build();
