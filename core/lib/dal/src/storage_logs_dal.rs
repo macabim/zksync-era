@@ -310,6 +310,13 @@ impl StorageLogsDal<'_, '_> {
         &mut self,
         l1_batch_number: L1BatchNumber,
     ) -> DalResult<HashMap<H256, H256>> {
+        // JIT compilation costs more than this indexed batch read. Roll back the
+        // read-only scope to restore the setting even inside a caller's transaction.
+        let mut transaction = self.storage.start_transaction().await?;
+        sqlx::query("SET LOCAL jit = off")
+            .instrument("get_touched_slots_for_l1_batch#disable_jit")
+            .execute(&mut transaction)
+            .await?;
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -341,8 +348,10 @@ impl StorageLogsDal<'_, '_> {
         )
         .instrument("get_touched_slots_for_l1_batch")
         .with_arg("l1_batch_number", &l1_batch_number)
-        .fetch_all(self.storage)
+        .fetch_all(&mut transaction)
         .await?;
+
+        transaction.rollback().await?;
 
         let touched_slots = rows.into_iter().map(|row| {
             (
@@ -858,6 +867,68 @@ mod tests {
             .mark_l2_blocks_as_executed_in_l1_batch(L1BatchNumber(number))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn touched_slots_restore_jit_in_nested_transaction() {
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = pool.connection().await.unwrap();
+        conn.protocol_versions_dal()
+            .save_protocol_version_with_tx(&ProtocolVersion::default())
+            .await
+            .unwrap();
+        for setting in ["on", "off"] {
+            sqlx::query("SELECT set_config('jit', $1, false)")
+                .bind(setting)
+                .execute(conn.conn())
+                .await
+                .unwrap();
+            // Check an ordinary connection before exercising a nested savepoint.
+            assert!(conn
+                .storage_logs_dal()
+                .get_touched_slots_for_l1_batch(L1BatchNumber(99))
+                .await
+                .unwrap()
+                .is_empty());
+            let actual: String = sqlx::query_scalar("SHOW jit")
+                .fetch_one(conn.conn())
+                .await
+                .unwrap();
+            assert_eq!(actual, setting);
+
+            let mut transaction = conn.start_transaction().await.unwrap();
+            let key = StorageKey::new(AccountTreeId::new(Address::repeat_byte(1)), H256::zero());
+            insert_l2_block(
+                &mut transaction,
+                1,
+                vec![
+                    StorageLog::new_write_log(key, H256::repeat_byte(1)),
+                    StorageLog::new_write_log(key, H256::zero()),
+                ],
+            )
+            .await;
+            let slots = transaction
+                .storage_logs_dal()
+                .get_touched_slots_for_l1_batch(L1BatchNumber(1))
+                .await
+                .unwrap();
+            assert_eq!(slots, HashMap::from([(key.hashed_key(), H256::zero())]));
+            let actual: String = sqlx::query_scalar("SHOW jit")
+                .fetch_one(transaction.conn())
+                .await
+                .unwrap();
+            assert_eq!(actual, setting);
+            // The inner rollback must preserve the caller's writes.
+            assert_eq!(
+                transaction
+                    .storage_logs_dal()
+                    .get_touched_slots_for_l1_batch(L1BatchNumber(1))
+                    .await
+                    .unwrap(),
+                slots
+            );
+            transaction.rollback().await.unwrap();
+        }
     }
 
     #[tokio::test]
