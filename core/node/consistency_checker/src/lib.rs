@@ -254,6 +254,32 @@ impl LocalL1BatchCommitData {
             .is_none_or(|version| version.is_pre_interop_fast_blocks())
     }
 
+    async fn verify_commitment_async(
+        self,
+        commitment: ethabi::Token,
+        is_gateway: bool,
+    ) -> Result<(), CheckError> {
+        let batch_number = self.l1_batch.header.number;
+        // Commitment reconstruction performs CPU-heavy KZG work. Keep it off the
+        // async executor, and await validation before advancing the checkpoint.
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            let started = std::time::Instant::now();
+            let result = self.verify_commitment(&commitment, is_gateway);
+            tracing::info!(
+                batch = batch_number.0,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Finished L1 commitment verification"
+            );
+            result
+        })
+        .await
+        .context("L1 commitment verification task failed")
+        .map_err(CheckError::Internal)?
+        .map_err(CheckError::Validation)
+    }
+
     /// All returned errors are validation errors.
     fn verify_commitment(&self, reference: &ethabi::Token, is_gateway: bool) -> anyhow::Result<()> {
         let protocol_version = self
@@ -443,7 +469,7 @@ impl ConsistencyChecker {
     async fn check_commitments(
         &self,
         batch_number: L1BatchNumber,
-        local: &LocalL1BatchCommitData,
+        local: LocalL1BatchCommitData,
     ) -> Result<(), CheckError> {
         let commit_tx_hash = local.commit_tx_hash;
         tracing::info!("Checking commit tx {commit_tx_hash} for L1 batch #{batch_number}");
@@ -543,9 +569,7 @@ impl ConsistencyChecker {
         .map_err(CheckError::Validation)?;
 
         let is_gateway = self.settlement_layer.is_gateway();
-        local
-            .verify_commitment(&commitment, is_gateway)
-            .map_err(CheckError::Validation)
+        local.verify_commitment_async(commitment, is_gateway).await
     }
 
     /// All returned errors are validation errors.
@@ -748,7 +772,7 @@ impl ConsistencyChecker {
                 }
             }
 
-            match self.check_commitments(batch_number, &local).await {
+            match self.check_commitments(batch_number, local).await {
                 Ok(()) => {
                     let mut storage = self.pool.connection().await?;
                     storage

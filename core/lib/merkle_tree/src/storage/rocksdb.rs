@@ -484,6 +484,41 @@ mod tests {
     use super::*;
     use crate::storage::tests::{create_patch, generate_nodes};
 
+    /// Compare decoding approaches without changing the database read algorithm.
+    #[test]
+    #[ignore = "CPU benchmark; run explicitly"]
+    fn profile_node_decoding() {
+        let mut node = InternalNode::default();
+        for nibble in 0..16 {
+            node.insert_child_ref(nibble, crate::types::ChildRef::leaf(123));
+        }
+        let mut bytes = Vec::new();
+        Node::Internal(node).serialize(&mut bytes);
+        let key = NodeKey::empty(123);
+        let inputs: Vec<_> = (0..70_000).map(|_| bytes.clone()).collect();
+        for iteration in 0..6 {
+            let started = std::time::Instant::now();
+            let serial: Vec<_> = inputs
+                .iter()
+                .map(|raw| RocksDBWrapper::deserialize_node(raw, &key, false).unwrap())
+                .collect();
+            println!(
+                "decode iteration={iteration} serial_us={}",
+                started.elapsed().as_micros()
+            );
+            let started = std::time::Instant::now();
+            let parallel: Vec<_> = inputs
+                .par_iter()
+                .map(|raw| RocksDBWrapper::deserialize_node(raw, &key, false).unwrap())
+                .collect();
+            println!(
+                "decode iteration={iteration} parallel_us={}",
+                started.elapsed().as_micros()
+            );
+            assert_eq!(serial, parallel);
+        }
+    }
+
     #[test]
     fn garbage_is_removed_on_db_reverts() {
         let dir = TempDir::new().expect("failed creating temporary dir for RocksDB");
