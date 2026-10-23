@@ -449,7 +449,7 @@ impl EN {
         scope::run!(ctx, |ctx, s| async {
             let (accepted, mut accepted_rx) = sync::watch::channel(None);
             let (send, mut recv) = ctx::channel::bounded(MAX_CONCURRENT_REQUESTS);
-            s.spawn::<()>(async {
+            s.spawn::<()>(async move {
                 let send = send;
                 loop {
                     // Accepted payloads keep prefetch moving during head-request stalls.
