@@ -38,6 +38,8 @@ use crate::{
 
 pub mod l2_block_seal_subtasks;
 
+mod initial_write_prefetch;
+
 impl UpdatesManager {
     /// Persists an L1 batch in the storage.
     /// This action includes a creation of an empty "fictive" L2 block that contains
@@ -110,6 +112,20 @@ impl UpdatesManager {
             current_l1_batch_number = self.l1_batch_number()
         );
 
+        let initial_writes_from_diffs: Option<Vec<_>> =
+            finished_batch.state_diffs.as_ref().map(|diffs| {
+                diffs
+                    .iter()
+                    .filter(|diff| diff.is_write_initial())
+                    .map(|diff| {
+                        H256(StorageKey::raw_hashed_key(
+                            &diff.address,
+                            &u256_to_h256(diff.key),
+                        ))
+                    })
+                    .collect()
+            });
+
         let progress = L1_BATCH_METRICS.start(L1BatchSealStage::InsertL1BatchHeader);
         let l2_to_l1_messages =
             VmEvent::extract_long_l2_to_l1_messages(&finished_batch.final_execution_state.events);
@@ -145,18 +161,33 @@ impl UpdatesManager {
             .as_deref()
             .unwrap_or_default();
 
-        transaction
-            .blocks_dal()
-            .mark_l1_batch_as_sealed(
+        // The sealing connection is already reserved. Prefetch uses spare connections
+        // and overlaps header persistence without changing COPY or its key order.
+        let header_result = {
+            let circuit_statistic = self.pending_execution_metrics().circuit_statistic;
+            let interop_fee = self.interop_fee();
+            let mut blocks_dal = transaction.blocks_dal();
+            let header = blocks_dal.mark_l1_batch_as_sealed(
                 &l1_batch,
                 final_bootloader_memory,
                 &finished_batch.final_execution_state.storage_refunds,
                 &finished_batch.final_execution_state.pubdata_costs,
-                self.pending_execution_metrics().circuit_statistic,
+                circuit_statistic,
                 ZK_SYNC_BYTES_PER_BLOB as u64,
-                self.interop_fee(),
-            )
-            .await?;
+                interop_fee,
+            );
+            let prefetch = initial_write_prefetch::prefetch(
+                &pool,
+                initial_writes_from_diffs.as_deref().unwrap_or_default(),
+            );
+            tokio::pin!(header, prefetch);
+            // Stop waiting for optional reads as soon as the header is saved.
+            tokio::select! {
+                result = &mut header => result,
+                () = &mut prefetch => header.await,
+            }
+        };
+        header_result?;
         progress.observe(None);
 
         if save_predicted_cycles {
@@ -215,16 +246,7 @@ impl UpdatesManager {
                 let all_writes_len = state_diffs.len();
 
                 (
-                    state_diffs
-                        .iter()
-                        .filter(|diff| diff.is_write_initial())
-                        .map(|diff| {
-                            H256(StorageKey::raw_hashed_key(
-                                &diff.address,
-                                &u256_to_h256(diff.key),
-                            ))
-                        })
-                        .collect(),
+                    initial_writes_from_diffs.expect("state diffs have initial write keys"),
                     all_writes_len,
                 )
             } else {

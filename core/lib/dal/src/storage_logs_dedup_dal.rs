@@ -12,7 +12,7 @@ use zksync_types::{
 };
 
 pub use crate::models::storage_log::DbInitialWrite;
-use crate::Core;
+use crate::{Core, CoreDal};
 
 #[derive(Debug)]
 pub struct StorageLogsDedupDal<'a, 'c> {
@@ -270,6 +270,32 @@ impl StorageLogsDedupDal<'_, '_> {
         .map(|row| row.index as u64))
     }
 
+    /// Warms index pages without changing initial writes or enumeration indices.
+    pub async fn prefetch_initial_write_keys(&mut self, hashed_keys: &[H256]) -> DalResult<()> {
+        if hashed_keys.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.storage.start_transaction().await?;
+        sqlx::query("SET TRANSACTION READ ONLY")
+            .instrument("prefetch_initial_write_keys#read_only")
+            .execute(&mut transaction)
+            .await?;
+        sqlx::query("SET LOCAL statement_timeout = '500ms'")
+            .instrument("prefetch_initial_write_keys#statement_timeout")
+            .execute(&mut transaction)
+            .await?;
+        sqlx::query("SET LOCAL lock_timeout = '100ms'")
+            .instrument("prefetch_initial_write_keys#lock_timeout")
+            .execute(&mut transaction)
+            .await?;
+        // Ignore the result: only the original sealing transaction decides what to insert.
+        transaction
+            .storage_logs_dedup_dal()
+            .filter_written_slots(hashed_keys)
+            .await?;
+        transaction.rollback().await
+    }
+
     /// Returns `hashed_keys` that are both present in the input and in `initial_writes` table.
     pub async fn filter_written_slots(&mut self, hashed_keys: &[H256]) -> DalResult<HashSet<H256>> {
         let hashed_keys: Vec<_> = hashed_keys.iter().map(H256::as_bytes).collect();
@@ -353,6 +379,157 @@ impl StorageLogsDedupDal<'_, '_> {
 mod tests {
     use super::*;
     use crate::{ConnectionPool, CoreDal};
+
+    #[tokio::test]
+    async fn prefetch_preserves_writes_order_and_connection_settings() {
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut conn = pool.connection().await.unwrap();
+        let keys = [
+            H256::repeat_byte(3),
+            H256::repeat_byte(1),
+            H256::repeat_byte(2),
+        ];
+        let before: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(conn.conn())
+            .await
+            .unwrap();
+        conn.storage_logs_dedup_dal()
+            .prefetch_initial_write_keys(&keys)
+            .await
+            .unwrap();
+        assert!(conn
+            .storage_logs_dedup_dal()
+            .dump_all_initial_writes_for_tests()
+            .await
+            .is_empty());
+        conn.storage_logs_dedup_dal()
+            .insert_initial_writes(L1BatchNumber(0), &keys)
+            .await
+            .unwrap();
+        conn.storage_logs_dedup_dal()
+            .prefetch_initial_write_keys(&keys)
+            .await
+            .unwrap();
+        conn.storage_logs_dedup_dal()
+            .prefetch_initial_write_keys(&[])
+            .await
+            .unwrap();
+        let mut writes = conn
+            .storage_logs_dedup_dal()
+            .dump_all_initial_writes_for_tests()
+            .await;
+        writes.sort_by_key(|write| write.index);
+        assert_eq!(writes.len(), keys.len());
+        for (i, write) in writes.iter().enumerate() {
+            assert_eq!(write.hashed_key, keys[i]);
+            assert_eq!(write.index, i as u64 + 1);
+        }
+        let after: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(conn.conn())
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let read_only: String = sqlx::query_scalar("SHOW transaction_read_only")
+            .fetch_one(conn.conn())
+            .await
+            .unwrap();
+        assert_eq!(read_only, "off");
+    }
+
+    #[tokio::test]
+    async fn cancelled_prefetch_rolls_back_settings_and_releases_connection() {
+        let test_pool = ConnectionPool::<Core>::test_pool().await;
+        let pool = ConnectionPool::<Core>::builder(test_pool.database_url().clone(), 2)
+            .build()
+            .await
+            .unwrap();
+        let mut inspector = test_pool.connection().await.unwrap();
+        let mut lock_conn = pool.connection().await.unwrap();
+        let mut lock = lock_conn.start_transaction().await.unwrap();
+        sqlx::query("LOCK initial_writes IN ACCESS EXCLUSIVE MODE")
+            .execute(lock.conn())
+            .await
+            .unwrap();
+        let mut conn = pool.connection().await.unwrap();
+        let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(conn.conn())
+            .await
+            .unwrap();
+        let before: (String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+        )
+        .fetch_one(conn.conn())
+        .await
+        .unwrap();
+        let keys = [H256::repeat_byte(4)];
+        {
+            let mut dal = conn.storage_logs_dedup_dal();
+            let probe = dal.prefetch_initial_write_keys(&keys);
+            tokio::pin!(probe);
+            let wait_until_blocked = async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
+                        .bind(backend).fetch_one(inspector.conn()).await.unwrap();
+                    if blocked {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut probe => panic!("probe completed before cancellation: {result:?}"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_until_blocked) => result.unwrap(),
+            }
+        }
+        // Production drops the pooled connection on cancellation. Its release hook
+        // drains pending responses and rolls back or discards the connection.
+        drop(conn);
+        let mut conn = tokio::time::timeout(std::time::Duration::from_secs(2), pool.connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let after: (String, String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout'), current_setting('transaction_read_only')")
+            .fetch_one(conn.conn()).await.unwrap();
+        assert_eq!((after.0, after.1), before);
+        assert_eq!(after.2, "off");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
+                    .bind(backend).fetch_one(inspector.conn()).await.unwrap();
+                if !blocked { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        lock.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prefetch_lock_timeout_does_not_poison_connection() {
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut lock_conn = pool.connection().await.unwrap();
+        let mut lock = lock_conn.start_transaction().await.unwrap();
+        sqlx::query("LOCK initial_writes IN ACCESS EXCLUSIVE MODE")
+            .execute(lock.conn())
+            .await
+            .unwrap();
+        let mut conn = pool.connection().await.unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            conn.storage_logs_dedup_dal()
+                .prefetch_initial_write_keys(&[H256::repeat_byte(4)]),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        lock.rollback().await.unwrap();
+        conn.storage_logs_dedup_dal()
+            .insert_initial_writes(L1BatchNumber(0), &[H256::repeat_byte(4)])
+            .await
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn getting_max_enumeration_index_in_batch() {
