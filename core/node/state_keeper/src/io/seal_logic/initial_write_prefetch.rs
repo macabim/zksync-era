@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use futures::{stream, StreamExt};
+use futures::{stream::FuturesUnordered, StreamExt};
 use zksync_dal::{ConnectionPool, Core, CoreDal};
 use zksync_types::H256;
 
@@ -17,30 +17,11 @@ pub(super) async fn prefetch(pool: &ConnectionPool<Core>, keys: &[H256]) {
     let keys = &keys[..keys.len().min(MAX_KEYS)];
     let concurrency = CONCURRENCY.min((pool.max_size() - 1) as usize);
     let chunks = keys.chunks(keys.len().div_ceil(concurrency));
-    let probes = stream::iter(chunks)
-        .map(|chunk| async move {
-            let Ok(Ok(mut connection)) = tokio::time::timeout(
-                Duration::from_millis(20),
-                pool.connection_tagged("initial_write_prefetch"),
-            )
-            .await
-            else {
-                return false;
-            };
-            match connection
-                .storage_logs_dedup_dal()
-                .prefetch_initial_write_keys(chunk)
-                .await
-            {
-                Ok(()) => true,
-                Err(err) => {
-                    tracing::debug!(%err, "Skipping initial write index prefetch");
-                    false
-                }
-            }
-        })
-        .buffer_unordered(concurrency)
-        .collect::<Vec<_>>();
+    let probes = FuturesUnordered::new();
+    for chunk in chunks {
+        probes.push(probe_chunk(pool, chunk));
+    }
+    let probes = probes.collect::<Vec<_>>();
     // Scoped futures leave no detached tasks. Each SQL query also has a server deadline.
     let result = tokio::time::timeout(Duration::from_millis(600), probes).await;
     tracing::info!(
@@ -52,6 +33,28 @@ pub(super) async fn prefetch(pool: &ConnectionPool<Core>, keys: &[H256]) {
         timed_out = result.is_err(),
         "Prefetched initial write index pages"
     );
+}
+
+async fn probe_chunk(pool: &ConnectionPool<Core>, keys: &[H256]) -> bool {
+    let Ok(Ok(mut connection)) = tokio::time::timeout(
+        Duration::from_millis(20),
+        pool.connection_tagged("initial_write_prefetch"),
+    )
+    .await
+    else {
+        return false;
+    };
+    match connection
+        .storage_logs_dedup_dal()
+        .prefetch_initial_write_keys(keys)
+        .await
+    {
+        Ok(()) => true,
+        Err(err) => {
+            tracing::debug!(%err, "Skipping initial write index prefetch");
+            false
+        }
+    }
 }
 
 #[cfg(test)]

@@ -164,20 +164,18 @@ impl UpdatesManager {
         // The sealing connection is already reserved. Prefetch uses spare connections
         // and overlaps header persistence without changing COPY or its key order.
         let header_result = {
-            let header = async {
-                transaction
-                    .blocks_dal()
-                    .mark_l1_batch_as_sealed(
-                        &l1_batch,
-                        final_bootloader_memory,
-                        &finished_batch.final_execution_state.storage_refunds,
-                        &finished_batch.final_execution_state.pubdata_costs,
-                        self.pending_execution_metrics().circuit_statistic,
-                        ZK_SYNC_BYTES_PER_BLOB as u64,
-                        self.interop_fee(),
-                    )
-                    .await
-            };
+            let circuit_statistic = self.pending_execution_metrics().circuit_statistic;
+            let interop_fee = self.interop_fee();
+            let mut blocks_dal = transaction.blocks_dal();
+            let header = blocks_dal.mark_l1_batch_as_sealed(
+                &l1_batch,
+                final_bootloader_memory,
+                &finished_batch.final_execution_state.storage_refunds,
+                &finished_batch.final_execution_state.pubdata_costs,
+                circuit_statistic,
+                ZK_SYNC_BYTES_PER_BLOB as u64,
+                interop_fee,
+            );
             let prefetch = initial_write_prefetch::prefetch(
                 &pool,
                 initial_writes_from_diffs.as_deref().unwrap_or_default(),
