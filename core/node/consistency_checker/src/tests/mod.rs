@@ -1035,3 +1035,25 @@ async fn blob_verification_keeps_executor_responsive_and_rejects_mismatch() {
     assert_matches!(err, CheckError::Validation(_));
     assert!(!err.is_retriable());
 }
+
+/// Run in separate processes with RAYON_NUM_THREADS to measure cold and warm KZG work.
+#[test]
+#[ignore = "CPU benchmark; run explicitly with a selected Rayon worker count"]
+fn profile_blob_commitment_cpu() {
+    use zksync_l1_contract_interface::i_executor::commit::kzg::KzgInfo;
+    let pubdata: Vec<_> = (0..120_000).map(|i| (i % 251) as u8).collect();
+    let mut expected = None;
+    for iteration in 0..4 {
+        let start = std::time::Instant::now();
+        let commitment = KzgInfo::new(&pubdata).to_pubdata_commitment();
+        println!(
+            "kzg iteration={iteration} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        if let Some(expected) = expected {
+            assert_eq!(commitment, expected);
+        } else {
+            expected = Some(commitment);
+        }
+    }
+}
