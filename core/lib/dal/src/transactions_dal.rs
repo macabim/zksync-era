@@ -1,4 +1,9 @@
-use std::{cmp::min, collections::HashMap, fmt, time::Duration};
+use std::{
+    cmp::min,
+    collections::HashMap,
+    fmt,
+    time::{Duration, Instant},
+};
 
 use bigdecimal::BigDecimal;
 use itertools::Itertools;
@@ -573,6 +578,7 @@ impl TransactionsDal<'_, '_> {
         // However on the EN, they need to be inserted after they are executed by the state keeper.
         insert_txs: bool,
     ) -> DalResult<()> {
+        let started = Instant::now();
         let mut transaction = self.storage.start_transaction().await?;
 
         let call_traces: Vec<(H256, Call)> = transactions
@@ -580,6 +586,9 @@ impl TransactionsDal<'_, '_> {
             .filter_map(|tx_res| tx_res.call_trace().map(|trace| (tx_res.hash, trace)))
             .collect();
 
+        let acquire_and_prepare_traces = started.elapsed();
+        let cleanup_started = Instant::now();
+        let mut cleanup = Duration::ZERO;
         if insert_txs {
             // There can be transactions in the DB in case of block rollback or if the DB was restored from a dump.
             let tx_hashes: Vec<_> = transactions.iter().map(|tx| tx.hash.as_bytes()).collect();
@@ -615,6 +624,7 @@ impl TransactionsDal<'_, '_> {
                 .await?;
             }
 
+            cleanup = cleanup_started.elapsed();
             // Different transaction types have different sets of fields to insert so we handle them separately.
             transaction
                 .transactions_dal()
@@ -652,12 +662,30 @@ impl TransactionsDal<'_, '_> {
                 .await?;
         }
 
+        let save_transactions = cleanup_started.elapsed().saturating_sub(cleanup);
+        let traces_started = Instant::now();
         transaction
             .transactions_dal()
             .insert_call_traces(&call_traces, protocol_version)
             .await?;
 
-        transaction.commit().await
+        let save_traces = traces_started.elapsed();
+        let commit_started = Instant::now();
+        transaction.commit().await?;
+        let commit = commit_started.elapsed();
+        if started.elapsed() >= Duration::from_millis(50) {
+            tracing::info!(
+                l2_block = l2_block_number.0,
+                transactions = transactions.len(),
+                ?acquire_and_prepare_traces,
+                ?cleanup,
+                ?save_transactions,
+                ?save_traces,
+                ?commit,
+                "slow transaction persistence stages"
+            );
+        }
+        Ok(())
     }
 
     // Bootloader currently doesn't return detailed errors.
