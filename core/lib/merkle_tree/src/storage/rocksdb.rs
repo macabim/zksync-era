@@ -317,7 +317,7 @@ impl Database for RocksDBWrapper {
     }
 
     fn tree_nodes(&self, keys: &NodeKeys) -> Vec<Option<Node>> {
-        let raw_nodes = self.raw_nodes(keys).into_iter().zip(keys);
+        let raw_nodes = self.raw_nodes(keys).into_par_iter().zip(keys.par_iter());
 
         let nodes = raw_nodes.map(|(maybe_node, (key, is_leaf))| {
             maybe_node
@@ -483,6 +483,38 @@ mod tests {
 
     use super::*;
     use crate::storage::tests::{create_patch, generate_nodes};
+
+    #[test]
+    fn batch_node_decoding_preserves_order_missing_nodes_and_errors() {
+        let dir = TempDir::new().unwrap();
+        let mut db = RocksDBWrapper::new(dir.path()).unwrap();
+        let nodes = generate_nodes(0, &[1, 2, 3]);
+        let mut keys: Vec<_> = nodes.keys().copied().collect();
+        keys.sort();
+        keys.reverse();
+        let missing = *generate_nodes(1, &[4]).keys().next().unwrap();
+        keys.push(missing);
+        let requested: Vec<_> = keys
+            .iter()
+            .cycle()
+            .take(2048)
+            .map(|key| (*key, true))
+            .collect();
+        let expected: Vec<_> = requested
+            .iter()
+            .map(|(key, _)| nodes.get(key).cloned())
+            .collect();
+        db.apply_patch(create_patch(0, Root::Empty, nodes)).unwrap();
+        assert_eq!(db.tree_nodes(&requested), expected);
+
+        let mut batch = db.db.new_write_batch();
+        batch.put_cf(MerkleTreeColumnFamily::Tree, &keys[0].to_db_key(), b"bad");
+        db.db.write(batch).unwrap();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            db.tree_nodes(&requested)
+        }))
+        .is_err());
+    }
 
     /// Compare decoding approaches without changing the database read algorithm.
     #[test]
