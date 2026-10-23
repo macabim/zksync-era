@@ -438,7 +438,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_prefetch_rolls_back_settings_and_releases_connection() {
-        let pool = ConnectionPool::<Core>::test_pool().await;
+        let test_pool = ConnectionPool::<Core>::test_pool().await;
+        let pool = ConnectionPool::<Core>::builder(test_pool.database_url().clone(), 2)
+            .build()
+            .await
+            .unwrap();
         let mut lock_conn = pool.connection().await.unwrap();
         let mut lock = lock_conn.start_transaction().await.unwrap();
         sqlx::query("LOCK initial_writes IN ACCESS EXCLUSIVE MODE")
@@ -446,26 +450,58 @@ mod tests {
             .await
             .unwrap();
         let mut conn = pool.connection().await.unwrap();
+        let backend: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+            .fetch_one(conn.conn())
+            .await
+            .unwrap();
         let before: (String, String) = sqlx::query_as(
             "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
         )
         .fetch_one(conn.conn())
         .await
         .unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(20),
-            conn.storage_logs_dedup_dal()
-                .prefetch_initial_write_keys(&[H256::repeat_byte(4)]),
-        )
-        .await;
-        assert!(result.is_err());
-        // The server deadline must end the blocked query even while the lock remains held.
-        let after: (String, String, String) = tokio::time::timeout(std::time::Duration::from_secs(2),
-            sqlx::query_as("SELECT current_setting('statement_timeout'), current_setting('lock_timeout'), current_setting('transaction_read_only')")
-                .fetch_one(conn.conn())
-        ).await.unwrap().unwrap();
+        let keys = [H256::repeat_byte(4)];
+        {
+            let mut dal = conn.storage_logs_dedup_dal();
+            let probe = dal.prefetch_initial_write_keys(&keys);
+            tokio::pin!(probe);
+            let wait_until_blocked = async {
+                loop {
+                    let blocked: bool = sqlx::query_scalar(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
+                        .bind(backend).fetch_one(lock.conn()).await.unwrap();
+                    if blocked {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            };
+            tokio::select! {
+                result = &mut probe => panic!("probe completed before cancellation: {result:?}"),
+                result = tokio::time::timeout(std::time::Duration::from_secs(2), wait_until_blocked) => result.unwrap(),
+            }
+        }
+        // Production drops the pooled connection on cancellation. Its release hook
+        // drains pending responses and rolls back or discards the connection.
+        drop(conn);
+        let mut conn = tokio::time::timeout(std::time::Duration::from_secs(2), pool.connection())
+            .await
+            .unwrap()
+            .unwrap();
+        let after: (String, String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout'), current_setting('transaction_read_only')")
+            .fetch_one(conn.conn()).await.unwrap();
         assert_eq!((after.0, after.1), before);
         assert_eq!(after.2, "off");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
+                    .bind(backend).fetch_one(lock.conn()).await.unwrap();
+                if !blocked { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
         lock.rollback().await.unwrap();
     }
 
