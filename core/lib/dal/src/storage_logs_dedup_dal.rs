@@ -437,6 +437,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_prefetch_rolls_back_settings_and_releases_connection() {
+        let pool = ConnectionPool::<Core>::test_pool().await;
+        let mut lock_conn = pool.connection().await.unwrap();
+        let mut lock = lock_conn.start_transaction().await.unwrap();
+        sqlx::query("LOCK initial_writes IN ACCESS EXCLUSIVE MODE")
+            .execute(lock.conn())
+            .await
+            .unwrap();
+        let mut conn = pool.connection().await.unwrap();
+        let before: (String, String) = sqlx::query_as(
+            "SELECT current_setting('statement_timeout'), current_setting('lock_timeout')",
+        )
+        .fetch_one(conn.conn())
+        .await
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            conn.storage_logs_dedup_dal()
+                .prefetch_initial_write_keys(&[H256::repeat_byte(4)]),
+        )
+        .await;
+        assert!(result.is_err());
+        // The server deadline must end the blocked query even while the lock remains held.
+        let after: (String, String, String) = tokio::time::timeout(std::time::Duration::from_secs(2),
+            sqlx::query_as("SELECT current_setting('statement_timeout'), current_setting('lock_timeout'), current_setting('transaction_read_only')")
+                .fetch_one(conn.conn())
+        ).await.unwrap().unwrap();
+        assert_eq!((after.0, after.1), before);
+        assert_eq!(after.2, "off");
+        lock.rollback().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn prefetch_lock_timeout_does_not_poison_connection() {
         let pool = ConnectionPool::<Core>::test_pool().await;
         let mut lock_conn = pool.connection().await.unwrap();

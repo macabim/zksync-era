@@ -163,8 +163,8 @@ impl UpdatesManager {
 
         // The sealing connection is already reserved. Prefetch uses spare connections
         // and overlaps header persistence without changing COPY or its key order.
-        let (header_result, ()) = tokio::join!(
-            async {
+        let header_result = {
+            let header = async {
                 transaction
                     .blocks_dal()
                     .mark_l1_batch_as_sealed(
@@ -177,12 +177,18 @@ impl UpdatesManager {
                         self.interop_fee(),
                     )
                     .await
-            },
-            initial_write_prefetch::prefetch(
+            };
+            let prefetch = initial_write_prefetch::prefetch(
                 &pool,
-                initial_writes_from_diffs.as_deref().unwrap_or_default()
-            )
-        );
+                initial_writes_from_diffs.as_deref().unwrap_or_default(),
+            );
+            tokio::pin!(header, prefetch);
+            // Stop waiting for optional reads as soon as the header is saved.
+            tokio::select! {
+                result = &mut header => result,
+                () = &mut prefetch => header.await,
+            }
+        };
         header_result?;
         progress.observe(None);
 
