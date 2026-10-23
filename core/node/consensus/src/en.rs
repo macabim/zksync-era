@@ -79,6 +79,21 @@ async fn wait_for_prefetch_head(
     wait_for_main_node_block(ctx, sync_state, |main| main.next() >= next).await
 }
 
+/// Advances only from the advertised head or consecutive payloads accepted by the queue.
+async fn wait_for_payload_or_head(
+    ctx: &ctx::Ctx,
+    sync_state: &SyncState,
+    accepted: &mut sync::watch::Receiver<Option<validator::BlockNumber>>,
+    next: validator::BlockNumber,
+) -> ctx::OrCanceled<()> {
+    tokio::select! {
+        result = wait_for_prefetch_head(ctx, sync_state, next) => result.map(|_| ()),
+        result = sync::wait_for_some(ctx, accepted, |block| {
+            block.filter(|block| block.next() >= next)
+        }) => result.map(|_| ()),
+    }
+}
+
 /// External node.
 pub(super) struct EN {
     pub(super) main_node_poll_interval: time::Duration,
@@ -314,7 +329,14 @@ impl EN {
                 }
             };
             match result {
-                Ok(Some(block)) => return Ok(block.try_into()?),
+                Ok(Some(block)) => {
+                    if block.number != n {
+                        return Err(
+                            anyhow::anyhow!("requested block {n}, got {}", block.number).into()
+                        );
+                    }
+                    return Ok(block.try_into()?);
+                }
                 Ok(None) => {
                     transient_retry = HttpRetry::default();
                     // Only the one speculative request polls at the head cadence.
@@ -424,21 +446,24 @@ impl EN {
     ) -> ctx::Result<()> {
         const MAX_CONCURRENT_REQUESTS: usize = 30;
         let mut next = queue.next();
-        scope::run!(ctx, |ctx, s| async {
+        scope::run!(ctx, |ctx, s| async move {
+            let (accepted, mut accepted_rx) = sync::watch::channel(None);
             let (send, mut recv) = ctx::channel::bounded(MAX_CONCURRENT_REQUESTS);
-            s.spawn::<()>(async {
+            s.spawn::<()>(async move {
                 let send = send;
                 loop {
-                    // Probe at most one block beyond the advertised head. The bounded
-                    // channel and ordered joins retain backpressure and block ordering.
-                    wait_for_prefetch_head(ctx, &self.sync_state, next).await?;
+                    // Accepted payloads keep prefetch moving during head-request stalls.
+                    // Probe only one unknown block; retain ordered joins and backpressure.
+                    wait_for_payload_or_head(ctx, &self.sync_state, &mut accepted_rx, next).await?;
                     send.send(ctx, s.spawn(self.fetch_block(ctx, next))).await?;
                     next = next.next();
                 }
             });
             loop {
                 let block = recv.recv(ctx).await?.join(ctx).await?;
+                let number = validator::BlockNumber(block.number.0.into());
                 queue.send(block).await.context("queue.send()")?;
+                accepted.send_replace(Some(number));
             }
         })
         .await
@@ -480,6 +505,145 @@ mod tests {
             settlement_layer: None,
             interop_fee: None,
         }
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_queues_payloads_with_frozen_head() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let transaction = zksync_test_contracts::Account::random().get_l2_tx_for_execute(
+            zksync_types::Execute {
+                contract_address: Some(Default::default()),
+                calldata: vec![],
+                value: Default::default(),
+                factory_deps: vec![],
+            },
+            None,
+        );
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |number: L2BlockNumber, _: bool| {
+                seen.lock().unwrap().push(number.0);
+                if number.0 > 3 {
+                    return Ok(None);
+                }
+                let mut payload = block();
+                payload.number = number;
+                payload.timestamp = u64::from(number.0);
+                payload.last_in_batch = false;
+                payload.transactions = Some(vec![transaction.clone()]);
+                Ok(Some(payload))
+            })
+            .build();
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(0));
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: state,
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let (sender, _receiver) = zksync_node_sync::sync_action::ActionQueue::new();
+        let mut queue = node
+            .pool
+            .connection(&ctx)
+            .await
+            .unwrap()
+            .new_payload_queue(&ctx, sender, node.sync_state.clone())
+            .await
+            .unwrap();
+        let result = node
+            .fetch_blocks(
+                &ctx.with_timeout(time::Duration::milliseconds(350)),
+                &mut queue,
+            )
+            .await;
+        assert!(matches!(result, Err(ctx::Error::Canceled(_))), "{result:?}");
+        assert_eq!(queue.next(), validator::BlockNumber(4));
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(&seen[..3], &[1, 2, 3]);
+        assert!(seen[3..].iter().all(|n| *n == 4));
+        assert!(
+            (4..=11).contains(&seen.len()),
+            "bounded null polling: {seen:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*requests.lock().unwrap(), seen, "no detached requests");
+        assert_eq!(
+            node.sync_state.subscribe().borrow().main_node_block(),
+            Some(L2BlockNumber(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_rejects_wrong_payload_number() {
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", |_: L2BlockNumber, _: bool| {
+                Ok(Some(block()))
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(node
+            .fetch_block(&ctx, validator::BlockNumber(43))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_progress_with_stalled_head() {
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(41));
+        let (accepted, mut received) = sync::watch::channel(None);
+        for number in 42..46 {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                wait_for_payload_or_head(
+                    &ctx,
+                    &state,
+                    &mut received,
+                    validator::BlockNumber(number),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // A missing or unaccepted payload cannot unlock another request.
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                wait_for_payload_or_head(
+                    &ctx,
+                    &state,
+                    &mut received,
+                    validator::BlockNumber(number + 1)
+                )
+            )
+            .await
+            .is_err());
+            accepted.send_replace(Some(validator::BlockNumber(number)));
+        }
+        assert_eq!(
+            state.subscribe().borrow().main_node_block(),
+            Some(L2BlockNumber(41))
+        );
+        // A fresh fetch loop discards its old payload watermark.
+        let (_accepted, mut fresh) = sync::watch::channel(None);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_payload_or_head(&ctx, &state, &mut fresh, validator::BlockNumber(46))
+        )
+        .await
+        .is_err());
+        state.set_main_node_block(L2BlockNumber(50));
+        wait_for_payload_or_head(&ctx, &state, &mut fresh, validator::BlockNumber(51))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
