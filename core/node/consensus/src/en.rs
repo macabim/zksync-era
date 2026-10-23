@@ -330,11 +330,11 @@ impl EN {
             };
             match result {
                 Ok(Some(block)) => {
-                    anyhow::ensure!(
-                        block.number == n,
-                        "requested block {n}, got {}",
-                        block.number
-                    );
+                    if block.number != n {
+                        return Err(
+                            anyhow::anyhow!("requested block {n}, got {}", block.number).into()
+                        );
+                    }
                     return Ok(block.try_into()?);
                 }
                 Ok(None) => {
