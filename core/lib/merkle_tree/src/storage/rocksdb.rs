@@ -490,7 +490,9 @@ mod tests {
         let mut db = RocksDBWrapper::new(dir.path()).unwrap();
         let mut nodes = generate_nodes(0, &[1, 2, 3]);
         let internal_key = *generate_nodes(0, &[4]).keys().next().unwrap();
-        nodes.insert(internal_key, Node::Internal(InternalNode::default()));
+        let mut internal = InternalNode::default();
+        internal.insert_child_ref(0, crate::types::ChildRef::leaf(0));
+        nodes.insert(internal_key, Node::Internal(internal));
         let mut keys: Vec<_> = nodes.keys().copied().collect();
         keys.sort_by_key(ToDbKey::to_db_key);
         keys.reverse();
