@@ -446,7 +446,7 @@ impl EN {
     ) -> ctx::Result<()> {
         const MAX_CONCURRENT_REQUESTS: usize = 30;
         let mut next = queue.next();
-        scope::run!(ctx, |ctx, s| async {
+        scope::run!(ctx, |ctx, s| async move {
             let (accepted, mut accepted_rx) = sync::watch::channel(None);
             let (send, mut recv) = ctx::channel::bounded(MAX_CONCURRENT_REQUESTS);
             s.spawn::<()>(async move {
