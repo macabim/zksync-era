@@ -552,12 +552,13 @@ mod tests {
             .new_payload_queue(&ctx, sender, node.sync_state.clone())
             .await
             .unwrap();
-        assert!(tokio::time::timeout(
-            std::time::Duration::from_millis(350),
-            node.fetch_blocks(&ctx, &mut queue)
-        )
-        .await
-        .is_err());
+        let result = node
+            .fetch_blocks(
+                &ctx.with_timeout(time::Duration::milliseconds(350)),
+                &mut queue,
+            )
+            .await;
+        assert!(matches!(result, Err(ctx::Error::Canceled(_))), "{result:?}");
         assert_eq!(queue.next(), validator::BlockNumber(4));
         let seen = requests.lock().unwrap().clone();
         assert_eq!(&seen[..3], &[1, 2, 3]);
