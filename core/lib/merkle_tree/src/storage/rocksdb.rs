@@ -488,7 +488,9 @@ mod tests {
     fn batch_node_decoding_preserves_order_missing_nodes_and_errors() {
         let dir = TempDir::new().unwrap();
         let mut db = RocksDBWrapper::new(dir.path()).unwrap();
-        let nodes = generate_nodes(0, &[1, 2, 3]);
+        let mut nodes = generate_nodes(0, &[1, 2, 3]);
+        let internal_key = *generate_nodes(0, &[4]).keys().next().unwrap();
+        nodes.insert(internal_key, Node::Internal(InternalNode::default()));
         let mut keys: Vec<_> = nodes.keys().copied().collect();
         keys.sort_by_key(ToDbKey::to_db_key);
         keys.reverse();
@@ -498,7 +500,7 @@ mod tests {
             .iter()
             .cycle()
             .take(2048)
-            .map(|key| (*key, true))
+            .map(|key| (*key, *key != internal_key))
             .collect();
         let expected: Vec<_> = requested
             .iter()
@@ -506,6 +508,7 @@ mod tests {
             .collect();
         db.apply_patch(create_patch(0, Root::Empty, nodes)).unwrap();
         assert_eq!(db.tree_nodes(&requested), expected);
+        assert!(db.tree_nodes(&[]).is_empty());
 
         let mut batch = db.db.new_write_batch();
         batch.put_cf(MerkleTreeColumnFamily::Tree, &keys[0].to_db_key(), b"bad");
