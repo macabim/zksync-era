@@ -443,6 +443,7 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let mut inspector = test_pool.connection().await.unwrap();
         let mut lock_conn = pool.connection().await.unwrap();
         let mut lock = lock_conn.start_transaction().await.unwrap();
         sqlx::query("LOCK initial_writes IN ACCESS EXCLUSIVE MODE")
@@ -469,7 +470,7 @@ mod tests {
                 loop {
                     let blocked: bool = sqlx::query_scalar(
                         "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
-                        .bind(backend).fetch_one(lock.conn()).await.unwrap();
+                        .bind(backend).fetch_one(inspector.conn()).await.unwrap();
                     if blocked {
                         break;
                     }
@@ -497,7 +498,7 @@ mod tests {
             loop {
                 let blocked: bool = sqlx::query_scalar(
                     "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')")
-                    .bind(backend).fetch_one(lock.conn()).await.unwrap();
+                    .bind(backend).fetch_one(inspector.conn()).await.unwrap();
                 if !blocked { break; }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
