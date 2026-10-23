@@ -309,7 +309,7 @@ impl EN {
         let mut transient_retry = HttpRetry::default();
         // Retry a stalled payload promptly, but expand the budget for large responses.
         // This deadline covers both hedged connections; dropping the future cancels both.
-        let mut payload_deadline = std::time::Duration::from_secs(2);
+        let mut payload_deadline = std::time::Duration::from_millis(750);
         loop {
             let result = ctx
                 .wait(tokio::time::timeout(
@@ -776,7 +776,7 @@ mod tests {
         };
         let ctx = ctx::test_root(&ctx::RealClock);
         let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(3),
+            std::time::Duration::from_millis(1500),
             node.fetch_block(&ctx, validator::BlockNumber(42)),
         )
         .await
@@ -810,15 +810,15 @@ mod tests {
         let ctx = ctx::test_root(&ctx::RealClock);
         let started = std::time::Instant::now();
         let fetched = tokio::time::timeout(
-            std::time::Duration::from_secs(6),
+            std::time::Duration::from_secs(8),
             node.fetch_block(&ctx, validator::BlockNumber(42)),
         )
         .await
         .unwrap()
         .unwrap();
         assert_eq!(fetched.number, L2BlockNumber(42));
-        assert_eq!(requests.load(Ordering::Relaxed), 2);
-        assert!(started.elapsed() >= std::time::Duration::from_millis(4700));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(5300));
     }
 
     #[tokio::test]
