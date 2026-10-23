@@ -16,7 +16,10 @@ use std::{
     collections::HashSet,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -124,6 +127,8 @@ pub struct Client<Net, C = DecompressedHttpClient> {
     metrics: &'static L2ClientMetrics,
     network: Net,
     sync_hedge_delay: Option<Duration>,
+    sync_transport: Arc<Mutex<Option<DecompressedHttpClient>>>,
+    sync_sequence: Arc<AtomicUsize>,
 }
 
 /// Client using the WebSocket transport.
@@ -237,8 +242,27 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
         // instead of holding every subsequent block behind this request.
         let head_deadline = tokio::time::sleep(Duration::from_secs(1));
         tokio::pin!(head_deadline);
+        // Alternate normal reads across independent pools to keep both connections warm.
+        // Clones share the pools and sequence, but never share a pool with each other lane.
+        let transport = {
+            let mut cached = self.sync_transport.lock().unwrap();
+            if cached.is_none() {
+                *cached = Some(
+                    Client::<Net>::http(self.url.clone())
+                        .map_err(|_| Error::Custom("cannot create sync HTTP transport".into()))?
+                        .client,
+                );
+            }
+            cached.as_ref().unwrap().clone()
+        };
+        let alternate = self.sync_sequence.fetch_add(1, Ordering::Relaxed) % 2 != 0;
         let primary = async {
-            self.inspect_call_result(origin, self.inner.request(method, params.clone()).await)
+            let result = if alternate {
+                transport.request(method, params.clone()).await
+            } else {
+                self.inner.request(method, params.clone()).await
+            };
+            self.inspect_call_result(origin, result)
         };
         tokio::pin!(primary);
         // Do not duplicate completed calls, including null payloads, RPC errors or HTTP 429.
@@ -248,13 +272,13 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
             _ = tokio::time::sleep(delay) => {
                 let duplicate = async {
                     self.limit_rate(origin).await?;
-                    // A fresh transport owns a separate connection pool. A cloned transport
-                    // could share the stalled HTTP/2 connection with the primary request.
-                    let transport = Client::<Net>::http(self.url.clone())
-                        .map_err(|_| Error::Custom("cannot create sync HTTP transport".into()))?
-                        .client;
                     self.metrics.hedged_requests[&label].inc();
-                    self.inspect_call_result(origin, transport.request(method, params.clone()).await)
+                    let result = if alternate {
+                        self.inner.request(method, params.clone()).await
+                    } else {
+                        transport.request(method, params.clone()).await
+                    };
+                    self.inspect_call_result(origin, result)
                 };
                 tokio::pin!(duplicate);
                 tokio::select! {
@@ -483,6 +507,8 @@ impl<Net: Network, C: ClientBase> ClientBuilder<Net, C> {
             }],
             network: self.network,
             sync_hedge_delay: self.sync_hedge_delay,
+            sync_transport: Arc::default(),
+            sync_sequence: Arc::default(),
         }
     }
 }

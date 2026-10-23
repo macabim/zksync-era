@@ -601,3 +601,23 @@ async fn head_deadline_does_not_cancel_large_sync_payloads() {
     assert!(started.elapsed() >= Duration::from_millis(1200));
     assert_eq!(server.requests.lock().unwrap().len(), 2);
 }
+
+#[tokio::test]
+async fn sync_reads_keep_two_independent_connections_warm_across_clones() {
+    let server = SyncHttpServer::new(|_| (Duration::ZERO, 200, serde_json::json!("0x2a"))).await;
+    let client = server.client();
+    for _ in 0..6 {
+        let value: String = client
+            .clone()
+            .request("eth_blockNumber", rpc_params![])
+            .await
+            .unwrap();
+        assert_eq!(value, "0x2a");
+    }
+    let requests = server.requests.lock().unwrap();
+    assert_eq!(requests.len(), 6);
+    assert_ne!(requests[0].0, requests[1].0);
+    for (i, request) in requests.iter().enumerate() {
+        assert_eq!(request.0, requests[i % 2].0);
+    }
+}
