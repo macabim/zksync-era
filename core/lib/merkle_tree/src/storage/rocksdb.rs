@@ -490,7 +490,7 @@ mod tests {
         let mut db = RocksDBWrapper::new(dir.path()).unwrap();
         let nodes = generate_nodes(0, &[1, 2, 3]);
         let mut keys: Vec<_> = nodes.keys().copied().collect();
-        keys.sort();
+        keys.sort_by_key(ToDbKey::to_db_key);
         keys.reverse();
         let missing = *generate_nodes(1, &[4]).keys().next().unwrap();
         keys.push(missing);
