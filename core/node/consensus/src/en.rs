@@ -11,7 +11,7 @@ use zksync_shared_resources::api::SyncState;
 use zksync_types::L2BlockNumber;
 use zksync_web3_decl::{
     client::{DynClient, L2},
-    error::is_retryable,
+    error::{is_retryable, is_transient_http_error},
     namespaces::{EnNamespaceClient as _, EthNamespaceClient as _},
 };
 
@@ -21,6 +21,35 @@ use crate::{
     registry::{Registry, RegistryAddress},
     storage::{self, ConnectionPool},
 };
+
+/// Backoff for transient HTTP failures and head timeouts. Other errors retain the five-second cooldown.
+struct HttpRetry(time::Duration);
+
+impl Default for HttpRetry {
+    fn default() -> Self {
+        Self(time::Duration::milliseconds(200))
+    }
+}
+
+impl HttpRetry {
+    fn after_error(
+        &mut self,
+        error: &zksync_web3_decl::jsonrpsee::core::ClientError,
+    ) -> time::Duration {
+        const MAX: time::Duration = time::Duration::seconds(5);
+        if !is_transient_http_error(error)
+            && !matches!(
+                error,
+                zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+            )
+        {
+            return MAX;
+        }
+        let delay = self.0;
+        self.0 = (delay + delay).min(MAX);
+        delay
+    }
+}
 
 /// Whenever more than FALLBACK_FETCHER_THRESHOLD certificates are missing,
 /// the fallback fetcher is active.
@@ -42,8 +71,32 @@ async fn wait_for_main_node_block(
     .await
 }
 
+async fn wait_for_prefetch_head(
+    ctx: &ctx::Ctx,
+    sync_state: &SyncState,
+    next: validator::BlockNumber,
+) -> ctx::OrCanceled<validator::BlockNumber> {
+    wait_for_main_node_block(ctx, sync_state, |main| main.next() >= next).await
+}
+
+/// Advances only from the advertised head or consecutive payloads accepted by the queue.
+async fn wait_for_payload_or_head(
+    ctx: &ctx::Ctx,
+    sync_state: &SyncState,
+    accepted: &mut sync::watch::Receiver<Option<validator::BlockNumber>>,
+    next: validator::BlockNumber,
+) -> ctx::OrCanceled<()> {
+    tokio::select! {
+        result = wait_for_prefetch_head(ctx, sync_state, next) => result.map(|_| ()),
+        result = sync::wait_for_some(ctx, accepted, |block| {
+            block.filter(|block| block.next() >= next)
+        }) => result.map(|_| ()),
+    }
+}
+
 /// External node.
 pub(super) struct EN {
+    pub(super) main_node_poll_interval: time::Duration,
     pub(super) pool: ConnectionPool,
     pub(super) sync_state: SyncState,
     pub(super) client: Box<DynClient<L2>>,
@@ -206,18 +259,20 @@ impl EN {
     /// Periodically fetches the head of the main node
     /// and updates `SyncState` accordingly.
     async fn fetch_state_loop(&self, ctx: &ctx::Ctx) -> ctx::Result<()> {
-        const DELAY_INTERVAL: time::Duration = time::Duration::milliseconds(500);
-        const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
+        let mut transient_retry = HttpRetry::default();
+        tracing::info!(poll_interval = ?self.main_node_poll_interval, "polling main node heads");
         loop {
             match ctx.wait(self.client.get_block_number()).await? {
                 Ok(head) => {
+                    transient_retry = HttpRetry::default();
                     let head = L2BlockNumber(head.try_into().ok().context("overflow")?);
                     self.sync_state.set_main_node_block(head);
-                    ctx.sleep(DELAY_INTERVAL).await?;
+                    ctx.sleep(self.main_node_poll_interval).await?;
                 }
                 Err(err) => {
-                    tracing::warn!("get_block_number(): {err}");
-                    ctx.sleep(RETRY_INTERVAL).await?;
+                    let retry_after = transient_retry.after_error(&err);
+                    tracing::warn!(?retry_after, "main node head request failed");
+                    ctx.sleep(retry_after).await?;
                 }
             }
         }
@@ -250,11 +305,96 @@ impl EN {
         const RETRY_INTERVAL: time::Duration = time::Duration::seconds(5);
         let n = L2BlockNumber(n.0.try_into().context("overflow")?);
         METRICS.fetch_block.inc();
+        let mut unavailable_retry = time::Duration::milliseconds(100);
+        let mut transient_retry = HttpRetry::default();
+        // Retry a stalled payload promptly, but expand the budget for large responses.
+        // This deadline covers both hedged connections; dropping the future cancels both.
+        let mut payload_deadline = std::time::Duration::from_millis(750);
         loop {
-            match ctx.wait(self.client.sync_l2_block(n, true)).await? {
-                Ok(Some(block)) => return Ok(block.try_into()?),
-                Ok(None) => {}
-                Err(err) if is_retryable(&err) => {}
+            let result = ctx
+                .wait(tokio::time::timeout(
+                    payload_deadline,
+                    self.client.sync_l2_block(n, true),
+                ))
+                .await?;
+            let result = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    tracing::warn!(
+                        l2_block = n.0,
+                        ?payload_deadline,
+                        "main node sync block deadline expired"
+                    );
+                    Err(zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout)
+                }
+            };
+            match result {
+                Ok(Some(block)) => {
+                    if block.number != n {
+                        return Err(
+                            anyhow::anyhow!("requested block {n}, got {}", block.number).into()
+                        );
+                    }
+                    return Ok(block.try_into()?);
+                }
+                Ok(None) => {
+                    transient_retry = HttpRetry::default();
+                    // Only the one speculative request polls at the head cadence.
+                    // Missing advertised payloads retain exponential backoff, so a gap
+                    // cannot fill the shared rate limiter with concurrent retries.
+                    let ahead_of_head = self
+                        .sync_state
+                        .subscribe()
+                        .borrow()
+                        .main_node_block()
+                        .is_some_and(|head| n > head);
+                    let retry_after = if ahead_of_head {
+                        self.main_node_poll_interval
+                            .max(time::Duration::milliseconds(50))
+                    } else {
+                        unavailable_retry
+                    };
+                    tracing::debug!(
+                        l2_block = n.0,
+                        ?retry_after,
+                        "main node block is not yet available"
+                    );
+                    ctx.sleep(retry_after).await?;
+                    if !ahead_of_head {
+                        unavailable_retry =
+                            (unavailable_retry + unavailable_retry).min(RETRY_INTERVAL);
+                    }
+                    continue;
+                }
+                Err(err)
+                    if is_transient_http_error(&err)
+                        || matches!(
+                            err,
+                            zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+                        ) =>
+                {
+                    if matches!(
+                        err,
+                        zksync_web3_decl::jsonrpsee::core::ClientError::RequestTimeout
+                    ) {
+                        payload_deadline =
+                            (payload_deadline * 2).min(std::time::Duration::from_secs(60));
+                    }
+                    let retry_after = transient_retry.after_error(&err);
+                    tracing::warn!(
+                        l2_block = n.0,
+                        ?retry_after,
+                        "main node sync block request failed transiently"
+                    );
+                    ctx.sleep(retry_after).await?;
+                    continue;
+                }
+                Err(err) if is_retryable(&err) => {
+                    tracing::warn!(
+                        l2_block = n.0,
+                        "retryable main node sync block request failure; retrying in five seconds"
+                    );
+                }
                 Err(err) => Err(err).with_context(|| format!("client.sync_l2_block({n})"))?,
             }
             ctx.sleep(RETRY_INTERVAL).await?;
@@ -306,21 +446,570 @@ impl EN {
     ) -> ctx::Result<()> {
         const MAX_CONCURRENT_REQUESTS: usize = 30;
         let mut next = queue.next();
-        scope::run!(ctx, |ctx, s| async {
+        scope::run!(ctx, |ctx, s| async move {
+            let (accepted, mut accepted_rx) = sync::watch::channel(None);
             let (send, mut recv) = ctx::channel::bounded(MAX_CONCURRENT_REQUESTS);
-            s.spawn::<()>(async {
+            s.spawn::<()>(async move {
                 let send = send;
                 loop {
-                    wait_for_main_node_block(ctx, &self.sync_state, |main| main >= next).await?;
+                    // Accepted payloads keep prefetch moving during head-request stalls.
+                    // Probe only one unknown block; retain ordered joins and backpressure.
+                    wait_for_payload_or_head(ctx, &self.sync_state, &mut accepted_rx, next).await?;
                     send.send(ctx, s.spawn(self.fetch_block(ctx, next))).await?;
                     next = next.next();
                 }
             });
             loop {
                 let block = recv.recv(ctx).await?.join(ctx).await?;
+                let number = validator::BlockNumber(block.number.0.into());
                 queue.send(block).await.context("queue.send()")?;
+                accepted.send_replace(Some(number));
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use zksync_contracts::BaseSystemContractsHashes;
+    use zksync_types::{api::en::SyncBlock, L1BatchNumber, ProtocolVersionId, H256};
+    use zksync_web3_decl::{client::MockClient, jsonrpsee::core::ClientError};
+
+    use super::*;
+
+    fn block() -> SyncBlock {
+        SyncBlock {
+            number: L2BlockNumber(42),
+            l1_batch_number: L1BatchNumber(1),
+            last_in_batch: true,
+            timestamp: 1,
+            l1_gas_price: 1,
+            l2_fair_gas_price: 1,
+            fair_pubdata_price: Some(1),
+            base_system_contracts_hashes: BaseSystemContractsHashes {
+                bootloader: H256::zero(),
+                default_aa: H256::zero(),
+                evm_emulator: None,
+            },
+            operator_address: Default::default(),
+            transactions: Some(vec![]),
+            virtual_blocks: Some(1),
+            hash: Some(H256::repeat_byte(42)),
+            protocol_version: ProtocolVersionId::Version30,
+            pubdata_params: Some(zksync_types::commitment::PubdataParams::genesis()),
+            pubdata_limit: None,
+            interop_roots: None,
+            settlement_layer: None,
+            interop_fee: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_queues_payloads_with_frozen_head() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = requests.clone();
+        let transaction = zksync_test_contracts::Account::random().get_l2_tx_for_execute(
+            zksync_types::Execute {
+                contract_address: Some(Default::default()),
+                calldata: vec![],
+                value: Default::default(),
+                factory_deps: vec![],
+            },
+            None,
+        );
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |number: L2BlockNumber, _: bool| {
+                seen.lock().unwrap().push(number.0);
+                if number.0 > 3 {
+                    return Ok(None);
+                }
+                let mut payload = block();
+                payload.number = number;
+                payload.timestamp = u64::from(number.0);
+                payload.last_in_batch = false;
+                payload.transactions = Some(vec![transaction.clone()]);
+                Ok(Some(payload))
+            })
+            .build();
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(0));
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: state,
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let (sender, _receiver) = zksync_node_sync::sync_action::ActionQueue::new();
+        let mut queue = node
+            .pool
+            .connection(&ctx)
+            .await
+            .unwrap()
+            .new_payload_queue(&ctx, sender, node.sync_state.clone())
+            .await
+            .unwrap();
+        let result = node
+            .fetch_blocks(
+                &ctx.with_timeout(time::Duration::milliseconds(350)),
+                &mut queue,
+            )
+            .await;
+        assert!(matches!(result, Err(ctx::Error::Canceled(_))), "{result:?}");
+        assert_eq!(queue.next(), validator::BlockNumber(4));
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(&seen[..3], &[1, 2, 3]);
+        assert!(seen[3..].iter().all(|n| *n == 4));
+        assert!(
+            (4..=11).contains(&seen.len()),
+            "bounded null polling: {seen:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(*requests.lock().unwrap(), seen, "no detached requests");
+        assert_eq!(
+            node.sync_state.subscribe().borrow().main_node_block(),
+            Some(L2BlockNumber(0))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_rejects_wrong_payload_number() {
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", |_: L2BlockNumber, _: bool| {
+                Ok(Some(block()))
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(node
+            .fetch_block(&ctx, validator::BlockNumber(43))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_progress_with_stalled_head() {
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(41));
+        let (accepted, mut received) = sync::watch::channel(None);
+        for number in 42..46 {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                wait_for_payload_or_head(
+                    &ctx,
+                    &state,
+                    &mut received,
+                    validator::BlockNumber(number),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            // A missing or unaccepted payload cannot unlock another request.
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                wait_for_payload_or_head(
+                    &ctx,
+                    &state,
+                    &mut received,
+                    validator::BlockNumber(number + 1)
+                )
+            )
+            .await
+            .is_err());
+            accepted.send_replace(Some(validator::BlockNumber(number)));
+        }
+        assert_eq!(
+            state.subscribe().borrow().main_node_block(),
+            Some(L2BlockNumber(41))
+        );
+        // A fresh fetch loop discards its old payload watermark.
+        let (_accepted, mut fresh) = sync::watch::channel(None);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            wait_for_payload_or_head(&ctx, &state, &mut fresh, validator::BlockNumber(46))
+        )
+        .await
+        .is_err());
+        state.set_main_node_block(L2BlockNumber(50));
+        wait_for_payload_or_head(&ctx, &state, &mut fresh, validator::BlockNumber(51))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_prefetch_stays_one_block_ahead() {
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(41));
+        wait_for_prefetch_head(&ctx, &state, validator::BlockNumber(42))
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            wait_for_prefetch_head(&ctx, &state, validator::BlockNumber(43)),
+        )
+        .await
+        .is_err());
+        state.set_main_node_block(L2BlockNumber(42));
+        wait_for_prefetch_head(&ctx, &state, validator::BlockNumber(43))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_speculative_null_polling_is_bounded_and_cancellable() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, full: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(full);
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(None::<SyncBlock>)
+                },
+            )
+            .build();
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(41));
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(0),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: state,
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(375),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .is_err());
+        let total = requests.load(Ordering::SeqCst);
+        assert!((5..=8).contains(&total), "bounded polling, got {total}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            total,
+            "no detached retries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_receives_payload_before_head_announcement() {
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", |number: L2BlockNumber, full: bool| {
+                assert_eq!(number, L2BlockNumber(42));
+                assert!(full);
+                Ok(Some(block()))
+            })
+            .build();
+        let state = SyncState::default();
+        state.set_main_node_block(L2BlockNumber(41));
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: state,
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            wait_for_prefetch_head(&ctx, &node.sync_state, validator::BlockNumber(42))
+                .await
+                .unwrap();
+            node.fetch_block(&ctx, validator::BlockNumber(42))
+                .await
+                .unwrap()
+        })
+        .await
+        .expect("payload must not wait for the head announcement");
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+        assert_eq!(
+            node.sync_state.subscribe().borrow().main_node_block(),
+            Some(L2BlockNumber(41))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_cancels_stalled_payload_before_retry() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let in_flight = active.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |_: L2BlockNumber, _: bool| {
+                let first = count.fetch_add(1, Ordering::SeqCst) == 0;
+                let active = in_flight.clone();
+                async move {
+                    assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                    let _guard = Active(active);
+                    if first {
+                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+                    }
+                    Ok(Some(block()))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_payload_deadline_expands_for_large_response() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |number: L2BlockNumber, _: bool| {
+                count.fetch_add(1, Ordering::Relaxed);
+                async move {
+                    assert_eq!(number, L2BlockNumber(42));
+                    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                    Ok(Some(block()))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let started = std::time::Instant::now();
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(5300));
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_unavailable_payload_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, with_transactions: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(with_transactions);
+                    Ok(if count.fetch_add(1, Ordering::Relaxed) < 2 {
+                        None
+                    } else {
+                        Some(block())
+                    })
+                },
+            )
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .expect("an announced block must not wait five seconds for a retry")
+        .unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_payload_timeout_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("en_syncL2Block", move |_: L2BlockNumber, _: bool| {
+                count.fetch_add(1, Ordering::Relaxed);
+                Err::<Option<SyncBlock>, _>(ClientError::RequestTimeout)
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .is_err());
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+    }
+    #[tokio::test]
+    async fn test_centralized_fetcher_retries_http_503_promptly() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let count = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method(
+                "en_syncL2Block",
+                move |number: L2BlockNumber, with_transactions: bool| {
+                    assert_eq!(number, L2BlockNumber(42));
+                    assert!(with_transactions);
+                    if count.fetch_add(1, Ordering::Relaxed) < 2 {
+                        let error =
+                            zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                                status_code: 503,
+                            };
+                        Err(ClientError::Transport(error.into()))
+                    } else {
+                        Ok(Some(block()))
+                    }
+                },
+            )
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        let started = std::time::Instant::now();
+        let fetched = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node.fetch_block(&ctx, validator::BlockNumber(42)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(requests.load(Ordering::Relaxed), 3);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(600));
+        assert_eq!(fetched.number, L2BlockNumber(42));
+        assert_eq!(fetched.reference_hash, block().hash);
+    }
+
+    #[test]
+    fn test_centralized_fetcher_http_retry_cap_reset_and_cooldown() {
+        let error = |status_code| {
+            ClientError::Transport(
+                zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                    status_code,
+                }
+                .into(),
+            )
+        };
+        let mut retry = HttpRetry::default();
+        for ms in [200, 400, 800, 1600, 3200, 5000, 5000] {
+            assert_eq!(
+                retry.after_error(&error(503)),
+                time::Duration::milliseconds(ms)
+            );
+        }
+        retry = HttpRetry::default();
+        assert_eq!(
+            retry.after_error(&error(503)),
+            time::Duration::milliseconds(200)
+        );
+        assert_eq!(retry.after_error(&error(429)), time::Duration::seconds(5));
+        assert_eq!(
+            retry.after_error(&ClientError::RequestTimeout),
+            time::Duration::milliseconds(400)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_head_retry_resets_after_success() {
+        check_head_retry_resets_after_success(false).await;
+    }
+
+    #[tokio::test]
+    async fn test_centralized_fetcher_head_timeout_retries_promptly() {
+        check_head_retry_resets_after_success(true).await;
+    }
+
+    async fn check_head_retry_resets_after_success(timeout: bool) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls = requests.clone();
+        let client = MockClient::builder(L2::default())
+            .method("eth_blockNumber", move || {
+                let mut calls = calls.lock().unwrap();
+                calls.push(std::time::Instant::now());
+                if matches!(calls.len(), 1 | 2 | 4) {
+                    if timeout {
+                        return Err(ClientError::RequestTimeout);
+                    }
+                    Err(ClientError::Transport(
+                        zksync_web3_decl::jsonrpsee::http_client::transport::Error::Rejected {
+                            status_code: 503,
+                        }
+                        .into(),
+                    ))
+                } else {
+                    Ok(zksync_types::U64::from(42))
+                }
+            })
+            .build();
+        let node = EN {
+            main_node_poll_interval: time::Duration::milliseconds(50),
+            pool: ConnectionPool::test(false, ProtocolVersionId::Version30).await,
+            sync_state: SyncState::default(),
+            client: Box::new(client),
+        };
+        let ctx = ctx::test_root(&ctx::RealClock);
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(1000),
+            node.fetch_state_loop(&ctx)
+        )
+        .await
+        .is_err());
+        let calls = requests.lock().unwrap();
+        assert!(calls.len() >= 5);
+        for (i, minimum, maximum) in [(0, 200, 350), (1, 400, 550), (3, 200, 350)] {
+            let elapsed = calls[i + 1].duration_since(calls[i]);
+            assert!(elapsed >= std::time::Duration::from_millis(minimum));
+            assert!(elapsed < std::time::Duration::from_millis(maximum));
+        }
+        assert_eq!(
+            node.sync_state.borrow().main_node_block(),
+            Some(L2BlockNumber(42))
+        );
     }
 }

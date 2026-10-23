@@ -984,3 +984,76 @@ async fn checker_detects_incorrect_tx_data_after_snapshot_recovery(
     )
     .await;
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn blob_verification_keeps_executor_responsive_and_rejects_mismatch() {
+    let mut batch = create_l1_batch_with_metadata(1);
+    batch.header.protocol_version = Some(ProtocolVersionId::Version26);
+    batch.header.pubdata_input = Some(vec![42; 150_000]);
+    let reference = CommitBatchInfo::new(
+        L1BatchCommitmentMode::Rollup,
+        &batch,
+        PubdataSendingMode::Blobs,
+    )
+    .into_token();
+    let make_local = || LocalL1BatchCommitData {
+        l1_batch: batch.clone(),
+        commit_tx_hash: H256::zero(),
+        commit_chain_id: None,
+        commitment_mode: L1BatchCommitmentMode::Rollup,
+    };
+
+    let (done_tx, mut done_rx) = watch::channel(false);
+    let heartbeat = tokio::spawn(async move {
+        let mut ticks = 0;
+        loop {
+            tokio::select! {
+                _ = done_rx.changed() => return ticks,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => ticks += 1,
+            }
+        }
+    });
+    make_local()
+        .verify_commitment_async(reference.clone(), false)
+        .await
+        .unwrap();
+    done_tx.send_replace(true);
+    assert!(
+        heartbeat.await.unwrap() > 0,
+        "verification blocks the async executor"
+    );
+
+    let mut invalid = reference;
+    let Token::Tuple(ref mut fields) = invalid else {
+        panic!("expected tuple")
+    };
+    fields[0] = Token::Uint(999.into());
+    let err = make_local()
+        .verify_commitment_async(invalid, false)
+        .await
+        .unwrap_err();
+    assert_matches!(err, CheckError::Validation(_));
+    assert!(!err.is_retriable());
+}
+
+/// Run in separate processes with RAYON_NUM_THREADS to measure cold and warm KZG work.
+#[test]
+#[ignore = "CPU benchmark; run explicitly with a selected Rayon worker count"]
+fn profile_blob_commitment_cpu() {
+    use zksync_l1_contract_interface::i_executor::commit::kzg::KzgInfo;
+    let pubdata: Vec<_> = (0..120_000).map(|i| (i % 251) as u8).collect();
+    let mut expected = None;
+    for iteration in 0..4 {
+        let start = std::time::Instant::now();
+        let commitment = KzgInfo::new(&pubdata).to_pubdata_commitment();
+        println!(
+            "kzg iteration={iteration} elapsed_ms={}",
+            start.elapsed().as_millis()
+        );
+        if let Some(expected) = expected {
+            assert_eq!(commitment, expected);
+        } else {
+            expected = Some(commitment);
+        }
+    }
+}

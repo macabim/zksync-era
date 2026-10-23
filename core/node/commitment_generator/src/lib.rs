@@ -200,6 +200,36 @@ impl CommitmentGenerator {
         })
     }
 
+    async fn calculate_blob_hashes(
+        l1_batch_number: L1BatchNumber,
+        num_blobs: usize,
+        pubdata_input: Vec<u8>,
+    ) -> anyhow::Result<Vec<BlobHash>> {
+        let span = tracing::Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _guard = span.enter();
+            let started = std::time::Instant::now();
+            let commitments = pubdata_to_blob_commitments(num_blobs, &pubdata_input);
+            let linear_hashes = pubdata_to_blob_linear_hashes(num_blobs, pubdata_input);
+            let hashes = commitments
+                .into_iter()
+                .zip(linear_hashes)
+                .map(|(commitment, linear_hash)| BlobHash {
+                    commitment,
+                    linear_hash,
+                })
+                .collect();
+            tracing::info!(
+                batch = l1_batch_number.0,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Finished blob commitment preparation"
+            );
+            hashes
+        })
+        .await
+        .context("blob commitment preparation task failed")
+    }
+
     #[tracing::instrument(skip(self))]
     async fn prepare_input(
         &self,
@@ -325,23 +355,12 @@ impl CommitmentGenerator {
                     format!("`pubdata_input` is missing for L1 batch #{l1_batch_number}")
                 })?;
 
-                let commitments = pubdata_to_blob_commitments(
-                    num_blobs_required(&protocol_version),
-                    &pubdata_input,
-                );
-                let linear_hashes = pubdata_to_blob_linear_hashes(
+                Self::calculate_blob_hashes(
+                    l1_batch_number,
                     num_blobs_required(&protocol_version),
                     pubdata_input,
-                );
-
-                commitments
-                    .into_iter()
-                    .zip(linear_hashes)
-                    .map(|(commitment, linear_hash)| BlobHash {
-                        commitment,
-                        linear_hash,
-                    })
-                    .collect::<Vec<_>>()
+                )
+                .await?
             } else {
                 vec![Default::default(); num_blobs_required(&protocol_version)]
             };

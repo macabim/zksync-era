@@ -342,3 +342,42 @@ fn test_convert_vm_events_to_log_queries() {
         assert_eq!(actual_list, expected_list);
     }
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn blob_preparation_preserves_hashes_and_executor_progress() {
+    let pubdata = vec![42; 150_000];
+    let commitments = pubdata_to_blob_commitments(2, &pubdata);
+    let linear_hashes = pubdata_to_blob_linear_hashes(2, pubdata.clone());
+    let (done_tx, mut done_rx) = watch::channel(false);
+    let heartbeat = tokio::spawn(async move {
+        let mut ticks = 0;
+        loop {
+            tokio::select! {
+                _ = done_rx.changed() => return ticks,
+                _ = tokio::time::sleep(Duration::from_millis(5)) => ticks += 1,
+            }
+        }
+    });
+    let actual = CommitmentGenerator::calculate_blob_hashes(L1BatchNumber(1), 2, pubdata)
+        .await
+        .unwrap();
+    done_tx.send_replace(true);
+    assert!(heartbeat.await.unwrap() > 0);
+    for ((actual, commitment), linear_hash) in actual.iter().zip(commitments).zip(linear_hashes) {
+        assert_eq!(actual.commitment, commitment);
+        assert_eq!(actual.linear_hash, linear_hash);
+    }
+    assert_eq!(actual.len(), 2);
+    let empty = CommitmentGenerator::calculate_blob_hashes(L1BatchNumber(1), 2, vec![])
+        .await
+        .unwrap();
+    assert_eq!(empty.len(), 2);
+    assert!(empty
+        .iter()
+        .all(|x| x.commitment == H256::zero() && x.linear_hash == H256::zero()));
+    assert!(
+        CommitmentGenerator::calculate_blob_hashes(L1BatchNumber(1), 0, vec![1])
+            .await
+            .is_err()
+    );
+}

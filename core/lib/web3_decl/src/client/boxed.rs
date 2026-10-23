@@ -11,7 +11,7 @@ use serde::de::DeserializeOwned;
 
 use super::{ForWeb3Network, Network, TaggedClient};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RawParams(pub(super) Option<Box<JsonRawValue>>);
 
 impl RawParams {

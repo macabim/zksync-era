@@ -385,7 +385,19 @@ impl StateKeeper {
         ctx: &ctx::Ctx,
         client: Box<DynClient<L2>>,
     ) -> anyhow::Result<()> {
+        self.run_fetcher_with_poll_interval(ctx, client, time::Duration::milliseconds(500))
+            .await
+    }
+
+    /// Runs the centralized fetcher with a selected head polling interval.
+    pub async fn run_fetcher_with_poll_interval(
+        self,
+        ctx: &ctx::Ctx,
+        client: Box<DynClient<L2>>,
+        main_node_poll_interval: time::Duration,
+    ) -> anyhow::Result<()> {
         en::EN {
+            main_node_poll_interval,
             pool: self.pool,
             client,
             sync_state: self.sync_state.clone(),
@@ -402,6 +414,7 @@ impl StateKeeper {
         cfgs: ConfigSet,
     ) -> anyhow::Result<()> {
         en::EN {
+            main_node_poll_interval: time::Duration::milliseconds(500),
             pool: self.pool,
             client,
             sync_state: self.sync_state.clone(),

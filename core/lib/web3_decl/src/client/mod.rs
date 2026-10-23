@@ -16,7 +16,10 @@ use std::{
     collections::HashSet,
     fmt,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -123,6 +126,9 @@ pub struct Client<Net, C = DecompressedHttpClient> {
     component_name: &'static str,
     metrics: &'static L2ClientMetrics,
     network: Net,
+    sync_hedge_delay: Option<Duration>,
+    sync_transport: Arc<Mutex<Option<DecompressedHttpClient>>>,
+    sync_sequence: Arc<AtomicUsize>,
 }
 
 /// Client using the WebSocket transport.
@@ -154,6 +160,15 @@ impl<Net: Network> Client<Net> {
             )
             .build(url.expose_str())?;
         Ok(ClientBuilder::new(client, url))
+    }
+}
+
+impl<Net: Network> ClientBuilder<Net> {
+    /// Duplicates slow sync reads once on a separate HTTP connection after 200 ms.
+    /// Both requests use the same endpoint and shared rate limit.
+    pub fn with_sync_request_hedging(mut self) -> Self {
+        self.sync_hedge_delay = Some(Duration::from_millis(200));
+        self
     }
 }
 
@@ -211,6 +226,77 @@ impl<Net: Network, C: ClientBase> Client<Net, C> {
             self.rate_limit.rate_limit_window
         );
         Ok(())
+    }
+
+    async fn sync_request(
+        &self,
+        method: &str,
+        params: boxed::RawParams,
+        delay: Duration,
+    ) -> Result<serde_json::Value, Error> {
+        let origin = CallOrigin::Request(method);
+        let label = method.to_owned();
+        let started = Instant::now();
+        self.metrics.sync_requests[&label].inc();
+        // Head responses are small. If both connections stall, let the fetcher retry
+        // instead of holding every subsequent block behind this request.
+        let head_deadline = tokio::time::sleep(Duration::from_secs(1));
+        tokio::pin!(head_deadline);
+        // Alternate normal reads across independent pools to keep both connections warm.
+        // Clones share the pools and sequence, but never share a pool with each other lane.
+        let transport = {
+            let mut cached = self.sync_transport.lock().unwrap();
+            if cached.is_none() {
+                *cached = Some(
+                    Client::<Net>::http(self.url.clone())
+                        .map_err(|_| Error::Custom("cannot create sync HTTP transport".into()))?
+                        .client,
+                );
+            }
+            cached.as_ref().unwrap().clone()
+        };
+        let alternate = self.sync_sequence.fetch_add(1, Ordering::Relaxed) % 2 != 0;
+        let primary = async {
+            let result = if alternate {
+                transport.request(method, params.clone()).await
+            } else {
+                self.inner.request(method, params.clone()).await
+            };
+            self.inspect_call_result(origin, result)
+        };
+        tokio::pin!(primary);
+        // Do not duplicate completed calls, including null payloads, RPC errors or HTTP 429.
+        let result = tokio::select! {
+            biased;
+            result = &mut primary => result,
+            _ = tokio::time::sleep(delay) => {
+                let duplicate = async {
+                    self.limit_rate(origin).await?;
+                    self.metrics.hedged_requests[&label].inc();
+                    let result = if alternate {
+                        self.inner.request(method, params.clone()).await
+                    } else {
+                        transport.request(method, params.clone()).await
+                    };
+                    self.inspect_call_result(origin, result)
+                };
+                tokio::pin!(duplicate);
+                tokio::select! {
+                    biased;
+                    result = &mut primary => result,
+                    _ = &mut head_deadline, if method == "eth_blockNumber" => {
+                        self.inspect_call_result(origin, Err(Error::RequestTimeout))
+                    }
+                    result = &mut duplicate => {
+                        self.metrics.hedge_wins[&label].inc();
+                        result
+                    }
+                }
+            }
+        };
+        // Dropping the other future cancels its request. No request task escapes this call.
+        self.metrics.sync_request_latency[&label].observe(started.elapsed());
+        result
     }
 
     fn inspect_call_result<T>(
@@ -271,6 +357,17 @@ impl<Net: Network, C: ClientBase> ClientT for Client<Net, C> {
     {
         let origin = CallOrigin::Request(method);
         self.limit_rate(origin).await?;
+        if let Some(delay) = self
+            .sync_hedge_delay
+            .filter(|_| matches!(method, "eth_blockNumber" | "en_syncL2Block"))
+        {
+            let params = boxed::RawParams(params.to_rpc_params()?);
+            let value = self.sync_request(method, params, delay).await?;
+            return self.inspect_call_result(
+                origin,
+                serde_json::from_value(value).map_err(Error::ParseError),
+            );
+        }
         self.inspect_call_result(origin, self.inner.request(method, params).await)
     }
 
@@ -328,6 +425,7 @@ pub struct ClientBuilder<Net, C = DecompressedHttpClient> {
     rate_limit: (usize, Duration),
     report_config: bool,
     network: Net,
+    sync_hedge_delay: Option<Duration>,
 }
 
 impl<Net: fmt::Debug, C: 'static> fmt::Debug for ClientBuilder<Net, C> {
@@ -352,6 +450,7 @@ impl<Net: Network, C: ClientBase> ClientBuilder<Net, C> {
             rate_limit: (1, Duration::ZERO),
             report_config: true,
             network: Net::default(),
+            sync_hedge_delay: None,
         }
     }
 
@@ -407,6 +506,9 @@ impl<Net: Network, C: ClientBase> ClientBuilder<Net, C> {
                 component: "",
             }],
             network: self.network,
+            sync_hedge_delay: self.sync_hedge_delay,
+            sync_transport: Arc::default(),
+            sync_sequence: Arc::default(),
         }
     }
 }

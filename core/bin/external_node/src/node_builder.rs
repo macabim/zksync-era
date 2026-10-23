@@ -229,6 +229,7 @@ impl ExternalNodeBuilder {
         let config = self.config.consensus.clone();
         let secrets = self.config.local.secrets.consensus.clone();
         let layer = ExternalNodeConsensusLayer {
+            main_node_poll_interval: self.config.local.node_sync.main_node_poll_interval,
             build_version: crate::metadata::SERVER_VERSION
                 .parse()
                 .context("CRATE_VERSION.parse()")?,

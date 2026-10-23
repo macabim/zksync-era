@@ -75,6 +75,25 @@ fn assert_common_prepared_env(config: &LocalConfig, observability: &Observabilit
 }
 
 #[test]
+fn parsing_head_arrival_intervals() {
+    let raw = format!(
+        "{}\nEN_NODE_SYNC_MAIN_NODE_POLL_INTERVAL=50ms\nEN_API_WEB3_JSON_RPC_PUBSUB_POLLING_INTERVAL=25ms\n",
+        include_str!("mainnet-config.env")
+    );
+    let env = smart_config::Environment::from_dotenv("config.env", &raw).unwrap();
+    let (config, observability) = parse_prepared_env(env);
+    assert_common_prepared_env(&config, &observability);
+    assert_eq!(
+        config.node_sync.main_node_poll_interval,
+        Duration::from_millis(50)
+    );
+    assert_eq!(
+        config.api.web3_json_rpc.pubsub_polling_interval,
+        Duration::from_millis(25)
+    );
+}
+
+#[test]
 fn parsing_prepared_mainnet_env() {
     let raw = include_str!("mainnet-config.env");
     let env = smart_config::Environment::from_dotenv("config.env", raw).unwrap();

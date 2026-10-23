@@ -16,6 +16,12 @@ The execution delay (the time L1 batches must wait before being executed) is now
 ValidatorTimelock contract via multicall. The system automatically queries the contract to determine the current
 execution delay setting.
 
+## Main node head polling
+
+`EN_NODE_SYNC_MAIN_NODE_POLL_INTERVAL` sets the delay after each successful main node head request. The default is
+`500ms`. Values must be between `1ms` and `60s`. A smaller value increases upstream RPC traffic. Failed requests keep
+the existing five-second retry delay. The setting does not change block execution, persistence, ordering, or validation.
+
 ## Database
 
 The Node uses two databases: PostgreSQL and RocksDB.
